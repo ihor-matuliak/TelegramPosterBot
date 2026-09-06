@@ -29,11 +29,11 @@ class Config:
             return []
 
     # Google Gemini AI
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 
     # Supabase Cloud Database
-    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
+    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "").strip().strip('"').strip("'")
 
     # Web Dashboard
     WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")
