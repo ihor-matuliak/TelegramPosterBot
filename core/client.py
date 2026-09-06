@@ -13,13 +13,17 @@ from config import config, BASE_DIR
 
 logger = logging.getLogger("TelegramClient")
 
-string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
+string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip().strip('"').strip("'")
 SESSION_TARGET = StringSession(string_session) if string_session else str(BASE_DIR / config.TELEGRAM_SESSION_NAME)
+
+# Avoid crash on module import if environment variables are not yet configured
+_safe_api_id = config.TELEGRAM_API_ID if config.TELEGRAM_API_ID else 1
+_safe_api_hash = config.TELEGRAM_API_HASH if config.TELEGRAM_API_HASH else "00000000000000000000000000000000"
 
 client = TelegramClient(
     SESSION_TARGET,
-    api_id=config.TELEGRAM_API_ID,
-    api_hash=config.TELEGRAM_API_HASH,
+    api_id=_safe_api_id,
+    api_hash=_safe_api_hash,
     device_model="Desktop PC",
     system_version="Windows 11",
     app_version="5.4.1"
@@ -28,12 +32,19 @@ client = TelegramClient(
 
 async def init_telegram_client() -> TelegramClient:
     """Initialize and connect the Telethon MTProto client."""
+    if not config.TELEGRAM_API_ID or not config.TELEGRAM_API_HASH:
+        logger.error(
+            "❌ [КРИТИЧНО] Змінні TELEGRAM_API_ID або TELEGRAM_API_HASH не налаштовані! "
+            "Будь ласка, відкрийте вкладку 'Variables' на Railway і додайте їх."
+        )
+        return client
+
     if not client.is_connected():
         logger.info("Connecting to Telegram MTProto...")
         await client.connect()
     
     if not await client.is_user_authorized():
-        logger.warning("Telegram client is NOT authorized yet! Please run login authorization.")
+        logger.warning("Telegram client is NOT authorized yet! Please configure TELEGRAM_STRING_SESSION or run login authorization.")
     else:
         me = await client.get_me()
         logger.info(f"Telegram client connected as: {me.first_name} (@{me.username or 'no_username'}) [ID: {me.id}]")

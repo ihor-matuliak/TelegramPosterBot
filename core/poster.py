@@ -77,9 +77,9 @@ class PosterWorker:
                     await asyncio.sleep(900)
                     continue
 
-                # 3. Check if user is authorized
-                if not await client.is_user_authorized():
-                    logger.warning("Poster idle: Telegram user is not authorized.")
+                # 3. Check if user is connected and authorized
+                if not client.is_connected() or not await client.is_user_authorized():
+                    logger.warning("Poster idle: Telegram user is not connected or not authorized.")
                     await asyncio.sleep(15)
                     continue
 

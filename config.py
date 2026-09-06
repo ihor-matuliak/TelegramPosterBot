@@ -10,8 +10,9 @@ load_dotenv(BASE_DIR / ".env")
 
 class Config:
     # Telegram MTProto Userbot
-    TELEGRAM_API_ID: int = int(os.getenv("TELEGRAM_API_ID", "0"))
-    TELEGRAM_API_HASH: str = os.getenv("TELEGRAM_API_HASH", "")
+    _api_id_raw: str = os.getenv("TELEGRAM_API_ID", "0").strip().strip('"').strip("'")
+    TELEGRAM_API_ID: int = int(_api_id_raw) if _api_id_raw.isdigit() else 0
+    TELEGRAM_API_HASH: str = os.getenv("TELEGRAM_API_HASH", "").strip().strip('"').strip("'")
     TELEGRAM_SESSION_NAME: str = os.getenv("TELEGRAM_SESSION_NAME", "poster_session")
 
     # Telegram Admin Bot
