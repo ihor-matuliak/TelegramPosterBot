@@ -1,0 +1,1484 @@
+# Feature: Contextual Telegram Channel & Group Discovery
+
+## 1. Мета
+
+Додати в існуючий Telegram-постер функцію **пошуку релевантних Telegram-груп і каналів за тематикою/контекстом**, а не лише за точним ключовим словом.
+
+Користувач вводить звичайний запит, наприклад:
+
+> `OnlyFans Fansly advertising groups`
+
+Система повинна самостійно визначити тематику запиту, сформувати пов'язані пошукові запити, знайти потенційно релевантні public groups/channels через Telegram API, оцінити їхню релевантність та показати користувачу відсортований список.
+
+Функція повинна працювати як **Discovery → Qualification → Results** і в майбутньому передавати схвалені користувачем чати безпосередньо в уже існуючу систему автопостингу.
+
+Telegram має `messages.searchGlobal` для глобального пошуку повідомлень і peer-ів, з можливістю окремо обмежити пошук каналами або групами, а `channels.searchPosts` дозволяє глобально шукати пости в public channels, у тому числі каналах, до яких користувач не приєднаний.
+
+---
+
+## 2. Основний user flow
+
+### Крок 1 — користувач вводить запит
+
+Наприклад:
+
+`OnlyFans Fansly promo groups`
+
+### Крок 2 — система аналізує контекст
+
+Не використовуємо лише exact match.
+
+Система повинна сформувати:
+
+**Primary terms**
+
+* OnlyFans
+* Fansly
+
+**Related terms**
+
+* OF
+* OF promotion
+* Fansly promotion
+* creator promotion
+* creator promo
+* adult creator
+* NSFW creator
+* shoutout
+* advertising
+* promo
+* paid promotion
+* marketing
+
+**Intent**
+
+* promotion
+* advertising
+* creator acquisition
+
+### Крок 3 — формується набір пошукових запитів
+
+Наприклад:
+
+```text
+OnlyFans
+Fansly
+OnlyFans promotion
+Fansly promotion
+OnlyFans promo
+Fansly promo
+creator promo
+adult creator promotion
+NSFW creator promo
+OF advertising
+Fansly advertising
+creator advertising
+```
+
+Не потрібно запускати всі запити одночасно. Повинні існувати:
+
+* query priority;
+* query limit;
+* concurrency limit;
+* pagination limit;
+* cooldown.
+
+### Крок 4 — Telegram Search
+
+Пошук виконується через Telegram client API.
+
+Для public channels використовувати `channels.searchPosts`.
+
+Для global search використовувати `messages.searchGlobal` із `broadcasts_only` або `groups_only`, залежно від типу пошуку.
+
+Важливо: `channels.searchPosts` має ліміти/квоти глобального пошуку; Telegram документує free search slots і можливість платного пошуку через Stars після вичерпання безкоштовної квоти. Тому пошук повинен запускатися **за явною дією користувача**, а не безперервним фоновим crawler-ом.
+
+---
+
+# 3. Candidate Collection
+
+Кожен результат Telegram search перетворюємо на candidate.
+
+Для кожного candidate намагаємося отримати:
+
+```text
+telegram_peer_id
+username
+title
+description
+type
+public/private status
+member/subscriber count (якщо доступно)
+matched query
+matched message
+matched message date
+```
+
+Типи:
+
+```text
+GROUP
+SUPERGROUP
+CHANNEL
+```
+
+Потрібно підтримати deduplication по:
+
+```text
+telegram_peer_id
+```
+
+і додатково по username, якщо peer ID відсутній/змінений.
+
+---
+
+# 4. Relevance Engine
+
+Це основна частина фічі.
+
+Не можна визначати релевантність лише за наявністю слова `OnlyFans`.
+
+Необхідно створити scoring model.
+
+### Початковий score
+
+```text
+relevance_score =
+
+keyword_score       * 0.25
+context_score       * 0.30
+content_score       * 0.20
+promo_score         * 0.15
+activity_score      * 0.10
+```
+
+Загальний результат:
+
+```text
+0–100
+```
+
+### Keyword score
+
+Перевіряємо:
+
+```text
+title
+username
+description
+matched search query
+```
+
+Приклад:
+
+```text
+"OnlyFans Promo"             → high
+"Fansly Creator Promotion"  → high
+"Creator Marketing"          → medium
+"Random NSFW"                → low
+```
+
+---
+
+# 5. Context Score
+
+Потрібно визначати **семантичну відповідність запиту**, а не тільки збіг слів.
+
+Наприклад:
+
+Запит:
+
+`OnlyFans promotion groups`
+
+Група:
+
+`Creator Marketing Hub`
+
+Назва не містить `OnlyFans`, але контент групи може складатися з:
+
+```text
+Buy promo
+Creator promotion
+OF traffic
+Fansly creators
+Shoutout available
+```
+
+Така група повинна отримувати високий score.
+
+Водночас не рекомендується будувати власну ML/AI модель на великому зібраному Telegram dataset. Telegram прямо забороняє scraping/indexing/aggregation даних платформи для розробки або навчання AI/ML моделей.
+
+Тому contextual scoring для MVP краще реалізувати через:
+
+* query expansion;
+* словники/таксономію;
+* weighted terms;
+* аналіз доступного контексту конкретного результату;
+* за потреби — зовнішній LLM лише на мінімальному фрагменті даних, необхідному для роботи функції, без побудови Telegram dataset.
+
+---
+
+# 6. Promo Score
+
+Окремо визначаємо:
+
+> Чи є цей канал/чат майданчиком для реклами?
+
+Шукаємо сигнали:
+
+```text
+promo
+promotion
+advertise
+advertising
+ads
+shoutout
+paid post
+buy promo
+promo available
+DM for promo
+post your content
+creator promo
+```
+
+Також враховуємо негативні сигнали:
+
+```text
+no ads
+no promo
+ads prohibited
+advertising prohibited
+```
+
+Приклад:
+
+```text
+OnlyFans Community
+```
+
+може бути дуже тематично релевантним, але не придатним для реклами.
+
+Тому:
+
+```text
+Relevance = 96
+Promo suitability = 20
+```
+
+і такий результат не повинен автоматично потрапити у top results для користувача, який шукає саме рекламні майданчики.
+
+---
+
+# 7. Activity Score
+
+Необхідно відкидати мертві групи/канали.
+
+Враховувати:
+
+```text
+last_message_at
+messages_24h
+messages_7d
+messages_30d
+```
+
+Приклад:
+
+```text
+Last message < 1 hour     → very high
+Last message < 24 hours   → high
+Last message < 7 days     → medium
+Last message > 30 days    → very low
+```
+
+Activity score не повинен повністю компенсувати низьку тематичну релевантність.
+
+---
+
+# 8. Final Score
+
+Після всіх компонентів:
+
+```text
+final_score =
+    relevance_score * 0.60
+  + promo_score      * 0.25
+  + activity_score   * 0.15
+```
+
+Після цього:
+
+```text
+90–100 → Highly Relevant
+75–89  → Relevant
+60–74  → Potentially Relevant
+<60    → Hide by default
+```
+
+Поріг повинен бути configurable.
+
+---
+
+# 9. Result UI
+
+Користувач повинен бачити не просто список username.
+
+Приклад:
+
+```text
+Search:
+OnlyFans Fansly promotion
+
+Found: 47 relevant results
+
+
+🔥 ONLYFANS PROMO HUB
+Type: Group
+Relevance: 96%
+Promo suitability: 94%
+Activity: High
+
+@onlyfanspromohub
+
+[Add to Posting]
+
+
+🔥 CREATOR MARKETING
+Type: Channel
+Relevance: 91%
+Promo suitability: 89%
+Activity: High
+
+@creatormarketing
+
+
+🟡 NSFW CREATOR NETWORK
+Type: Group
+Relevance: 78%
+Promo suitability: 72%
+Activity: Medium
+```
+
+Кнопки:
+
+```text
+Add to posting
+Open in Telegram
+Hide
+Not relevant
+Save
+```
+
+---
+
+# 10. User Feedback
+
+Додати можливість:
+
+```text
+👍 Relevant
+👎 Not relevant
+```
+
+Але feedback **не повинен створювати глобальну ML-модель на Telegram data**.
+
+Він може використовуватися для:
+
+* налаштування персональних keyword weights;
+* блокування конкретних результатів;
+* збереження user-specific preferences;
+* покращення ranking rules для конкретного користувача.
+
+---
+
+# 11. Pagination / Progressive Discovery
+
+Не потрібно шукати та показувати все одразу.
+
+Система повинна працювати порціями.
+
+Наприклад:
+
+```text
+Initial search
+↓
+10–20 candidates
+↓
+Ranking
+↓
+Show top 5
+↓
+Load more
+↓
+next 5
+```
+
+Або:
+
+```text
+Search task created
+
+Batch #1 → 5 results
+Batch #2 → +5 results
+Batch #3 → +5 results
+...
+```
+
+Це дозволить контролювати Telegram API usage і UX.
+
+---
+
+# 12. Supabase
+
+Додати окрему таблицю:
+
+```text
+discovery_searches
+```
+
+Поля:
+
+```text
+id
+user_id
+query
+status
+created_at
+completed_at
+total_candidates
+total_relevant
+error
+```
+
+Статуси:
+
+```text
+pending
+searching
+ranking
+completed
+failed
+cancelled
+```
+
+### Таблиця `discovery_queries`
+
+Зберігати згенеровані пошукові запити:
+
+```text
+id
+search_id
+query
+query_type
+priority
+status
+results_count
+created_at
+completed_at
+```
+
+`query_type`:
+
+```text
+primary
+related
+context
+hashtag
+```
+
+### Таблиця `discovery_results`
+
+```text
+id
+search_id
+telegram_peer_id
+username
+title
+description
+type
+matched_query
+relevance_score
+promo_score
+activity_score
+final_score
+last_message_at
+first_seen_at
+status
+```
+
+`status`:
+
+```text
+new
+saved
+approved
+rejected
+hidden
+```
+
+### Таблиця `saved_sources`
+
+Для вже знайдених та затверджених користувачем каналів/груп:
+
+```text
+id
+user_id
+telegram_peer_id
+username
+title
+type
+source
+relevance_score
+promo_score
+created_at
+```
+
+Цю таблицю можна в майбутньому інтегрувати з вашою існуючою таблицею джерел для автопостингу.
+
+---
+
+# 13. Backend Services
+
+Розділити функціональність на окремі services:
+
+```text
+Discovery API
+     ↓
+Query Expansion Service
+     ↓
+Telegram Search Worker
+     ↓
+Candidate Normalizer
+     ↓
+Deduplication Service
+     ↓
+Relevance Scoring Service
+     ↓
+Activity/Promo Analyzer
+     ↓
+Ranking
+     ↓
+Supabase
+```
+
+### Discovery API
+
+Endpoint:
+
+```http
+POST /discovery/search
+```
+
+Body:
+
+```json
+{
+  "query": "OnlyFans Fansly advertising groups",
+  "limit": 20,
+  "include_groups": true,
+  "include_channels": true
+}
+```
+
+Response:
+
+```json
+{
+  "search_id": "...",
+  "status": "pending"
+}
+```
+
+Результати отримувати через:
+
+```http
+GET /discovery/search/:id
+```
+
+---
+
+# 14. Telegram Worker
+
+Worker повинен:
+
+1. Отримати `search_id`.
+2. Отримати generated queries.
+3. Виконати Telegram searches.
+4. Зберегти raw candidate metadata, необхідну для поточного результату.
+5. Deduplicate.
+6. Запустити scoring.
+7. Зберегти ranked results.
+8. Оновити статус search.
+
+Не робити нескінченний Telegram crawler.
+
+У Telegram API є rate/search constraints, тому worker повинен мати:
+
+* concurrency limit;
+* retry;
+* backoff;
+* flood/error handling;
+* query budget;
+* pagination budget.
+
+---
+
+# 15. Важливе обмеження для MVP
+
+Feature повинна працювати за принципом:
+
+```text
+User enters query
+        ↓
+User explicitly starts search
+        ↓
+Telegram discovery
+        ↓
+Results
+```
+
+Не:
+
+```text
+24/7 crawler
+↓
+сканує Telegram
+↓
+будує постійний глобальний каталог
+```
+
+Telegram прямо обмежує scraping та агрегацію даних платформи; Bot Platform Terms також забороняють збір/зберігання/агрегацію даних понад необхідне для роботи сервісу та окремо вказують на заборону scraping public group/channel contents.
+
+Тому архітектура має зберігати **мінімум даних, необхідний для функціонування discovery-фічі**, а не створювати глобальну базу всіх Telegram-груп.
+
+---
+
+# 16. MVP Scope
+
+Перша версія повинна включати:
+
+```text
+✅ Search by natural-language query
+✅ Query expansion
+✅ Global Telegram search
+✅ Search groups
+✅ Search channels
+✅ Candidate deduplication
+✅ Relevance scoring
+✅ Promo suitability scoring
+✅ Activity scoring
+✅ Result ranking
+✅ Pagination
+✅ Save result
+✅ Add result to existing posting system
+✅ Search history
+✅ Supabase persistence
+✅ Error/retry handling
+```
+
+Не включати в MVP:
+
+```text
+❌ 24/7 Telegram crawler
+❌ Global Telegram database
+❌ Automatic ML training on Telegram content
+❌ Automatic joining of groups
+❌ Automatic posting into newly discovered groups
+```
+
+Останній пункт краще залишити на **explicit user approval**, після чого використати вже існуючий scheduler/posting pipeline.
+
+---
+
+# 17. Приклад повного сценарію
+
+Користувач вводить:
+
+```text
+Adult creator promotion OnlyFans Fansly
+```
+
+Система генерує:
+
+```text
+OnlyFans promotion
+Fansly promotion
+OnlyFans promo
+Fansly promo
+adult creator promo
+creator promotion
+NSFW creator promotion
+OF advertising
+Fansly advertising
+creator marketing
+```
+
+Telegram Search знаходить:
+
+```text
+143 candidates
+```
+
+Deduplication:
+
+```text
+143 → 101
+```
+
+Activity filter:
+
+```text
+101 → 72
+```
+
+Relevance scoring:
+
+```text
+72 → 38 relevant
+```
+
+Final ranking:
+
+```text
+Top 10
+```
+
+Користувач бачить:
+
+```text
+98%  OnlyFans Promo Hub
+95%  Fansly Creator Promotion
+93%  Creator Marketing Network
+91%  OF Shoutout Hub
+88%  Adult Creator Promo
+...
+```
+
+Натискає:
+
+```text
+Add to posting
+```
+
+Результат автоматично передається в уже існуючу систему:
+
+```text
+Discovery
+   ↓
+Saved Sources
+   ↓
+Posting Sources
+   ↓
+Existing Scheduler
+   ↓
+Existing Auto Poster
+```
+
+Таким чином **ми не переписуємо вашу існуючу систему автопостингу**, а просто створюємо новий Discovery Layer над нею.
+
+---
+
+# 18. Definition of Done
+
+Фіча вважається готовою, коли:
+
+* користувач може ввести звичайний тематичний запит;
+* система генерує пов'язані пошукові запити;
+* система знаходить public Telegram groups/channels через доступні Telegram search API;
+* результати deduplicate;
+* кожен candidate отримує relevance score;
+* окремо визначається advertising/promo suitability;
+* враховується activity;
+* результати сортуються за final score;
+* користувач бачить top results із пояснюваними score;
+* користувач може зберегти result;
+* користувач може додати result у джерела для існуючого автопостингу;
+* пошук має pagination/budget/rate-limit handling;
+* результати та історія search зберігаються в Supabase;
+* система не працює як безперервний глобальний scraper.
+
+## Очікуваний результат
+
+Після реалізації користувачеві більше не потрібно знати конкретний username або назву Telegram-групи. Він описує **що саме шукає**, а система самостійно знаходить, кваліфікує та ранжує релевантні public groups/channels.
+
+Це має стати окремим модулем продукту:
+
+**Telegram Source Discovery → Qualified Sources → Auto Posting.**
+
+# AI Layer — роль AI у функції Contextual Telegram Channel & Group Discovery
+
+## 1. Мета AI-модуля
+
+AI не повинен замінювати Telegram Search або backend scoring.
+
+Його роль — **розуміти сенс пошукового запиту, знаходити прихований тематичний зв'язок між запитом і Telegram-джерелом та допомагати правильно ранжувати результати**.
+
+Основна задача:
+
+> Користувач формулює запит людською мовою → AI перетворює його на структурований intent → система знаходить candidates через Telegram API → AI визначає, наскільки кожен candidate відповідає цьому intent.
+
+---
+
+# 2. AI Query Understanding
+
+Після введення користувачем запиту AI повинен проаналізувати його та визначити:
+
+### Intent
+
+Що саме користувач хоче знайти.
+
+Наприклад:
+
+```text
+"чати для реклами OnlyFans моделей"
+```
+
+AI визначає:
+
+```text
+intent:
+advertising / promotion
+```
+
+### Main entities
+
+```text
+OnlyFans
+models
+adult creators
+```
+
+### Context
+
+```text
+adult creator marketing
+promotion
+advertising
+traffic
+shoutouts
+```
+
+### Desired source
+
+```text
+Telegram groups
+Telegram channels
+```
+
+### User objective
+
+У цьому прикладі:
+
+```text
+find places where advertising/promotion is allowed
+```
+
+AI повинен відрізняти:
+
+> «хочу знайти контент про OnlyFans»
+
+від:
+
+> «хочу знайти Telegram-чати, де можна рекламувати OnlyFans».
+
+Це критично для правильного ranking.
+
+---
+
+# 3. Query Expansion
+
+AI повинен генерувати набір пов'язаних пошукових термінів.
+
+Наприклад:
+
+```text
+User query:
+OnlyFans Fansly advertising groups
+```
+
+AI формує:
+
+### Primary
+
+```text
+OnlyFans
+Fansly
+```
+
+### Promotion
+
+```text
+OnlyFans promotion
+Fansly promotion
+OnlyFans promo
+Fansly promo
+```
+
+### Related context
+
+```text
+creator promotion
+creator marketing
+adult creator promotion
+NSFW creator promo
+model promotion
+```
+
+### Advertising intent
+
+```text
+advertising
+ads
+paid promotion
+shoutout
+promo
+promotion available
+```
+
+### Abbreviations / aliases
+
+```text
+OF
+OF promo
+OF promotion
+```
+
+AI повинен генерувати synonyms, abbreviations, related concepts та variations запиту.
+
+При цьому кількість generated queries повинна бути обмежена конфігурацією, наприклад `10–30`, щоб не створювати надмірне навантаження на Telegram Search.
+
+---
+
+# 4. Query Classification
+
+AI повинен визначати тип пошуку.
+
+Приклад:
+
+```text
+search_type:
+advertising_source
+```
+
+Інші можливі типи:
+
+```text
+content
+community
+marketplace
+promotion
+creator_network
+discussion
+jobs
+services
+```
+
+Це дозволить використовувати різні scoring rules.
+
+Наприклад для:
+
+> `OnlyFans promo groups`
+
+`promo_score` має більшу вагу.
+
+Для:
+
+> `OnlyFans creator communities`
+
+більшу вагу повинен мати `community_relevance`.
+
+---
+
+# 5. Candidate Semantic Analysis
+
+Після Telegram Search backend отримує candidates.
+
+Наприклад:
+
+```text
+Title:
+Creator Marketing Hub
+
+Description:
+Community for digital creators.
+
+Matched posts:
+"Paid shoutouts available"
+"OF creator promotion"
+"Looking for Fansly creators"
+```
+
+AI повинен визначити:
+
+```text
+relevance = 94
+promo_suitability = 97
+context_match = 95
+```
+
+Навіть якщо title не містить `OnlyFans`.
+
+Тобто AI повинен розуміти **контекст**, а не тільки exact keyword match.
+
+---
+
+# 6. Relevance Classification
+
+AI повинен класифікувати candidate:
+
+```text
+HIGHLY_RELEVANT
+RELEVANT
+POSSIBLY_RELEVANT
+IRRELEVANT
+```
+
+Приклад:
+
+```text
+OnlyFans Promotion Hub
+→ HIGHLY_RELEVANT
+
+Creator Marketing Network
+→ RELEVANT
+
+NSFW Community
+→ POSSIBLY_RELEVANT
+
+Random Memes
+→ IRRELEVANT
+```
+
+---
+
+# 7. Advertising / Promo Detection
+
+Окремо AI повинен визначати:
+
+> Чи є цей Telegram source потенційним майданчиком для реклами?
+
+Наприклад:
+
+```text
+"This group is dedicated to creator promotions.
+Members regularly post paid shoutouts."
+```
+
+→
+
+```text
+is_advertising_source = true
+promo_suitability = 95
+```
+
+А:
+
+```text
+"OnlyFans discussion community. No advertising."
+```
+
+→
+
+```text
+is_advertising_source = false
+promo_suitability = 5
+```
+
+Особливо важливо виявляти негативні сигнали:
+
+```text
+no ads
+no promotion
+advertising prohibited
+promo prohibited
+```
+
+Тобто AI має враховувати **і позитивні, і негативні contextual signals**.
+
+---
+
+# 8. Context Mismatch Detection
+
+AI повинен відсікати misleading candidates.
+
+Наприклад запит:
+
+```text
+OnlyFans promotion
+```
+
+Candidate:
+
+```text
+OnlyFans News
+```
+
+AI бачить:
+
+```text
+topic_match = high
+advertising_intent = low
+```
+
+Тому candidate не повинен потрапляти високо у видачу.
+
+Інший приклад:
+
+```text
+Title:
+Adult Models
+
+Content:
+news, memes, photos
+```
+
+AI повинен визначити:
+
+```text
+adult_context = true
+promotion_context = false
+```
+
+І знизити його позицію.
+
+---
+
+# 9. AI Reranking
+
+Після первинного rule-based filtering система повинна віддати AI тільки top candidates.
+
+Наприклад:
+
+```text
+500 Telegram candidates
+        ↓
+Rules / keyword / activity
+        ↓
+50 candidates
+        ↓
+AI ranking
+        ↓
+Top 10–20
+```
+
+AI повинен отримувати:
+
+```text
+User intent
++
+Candidate title
++
+Description
++
+Relevant matched text/posts
+```
+
+і повертати structured score.
+
+Приклад:
+
+```json
+{
+  "relevance_score": 93,
+  "context_match_score": 96,
+  "promo_suitability_score": 91,
+  "confidence": 89,
+  "classification": "highly_relevant"
+}
+```
+
+---
+
+# 10. Explanation Generation
+
+AI повинен вміти коротко пояснювати, чому candidate був знайдений.
+
+Наприклад:
+
+```text
+"Highly relevant because the group focuses on creator promotion and contains recurring references to paid OnlyFans/Fansly promotion."
+```
+
+Це можна показувати користувачу:
+
+```text
+Why relevant:
+Creator promotion + OnlyFans/Fansly + paid promo activity
+```
+
+Пояснення повинні бути короткими та базуватися лише на фактично переданому AI контексті.
+
+---
+
+# 11. Confidence Score
+
+AI повинен повертати confidence.
+
+Наприклад:
+
+```text
+relevance: 94
+confidence: 96
+```
+
+Або:
+
+```text
+relevance: 78
+confidence: 52
+```
+
+Це важливо, тому що:
+
+> високий relevance + низький confidence
+
+означає, що candidate потенційно хороший, але AI недостатньо даних для впевненого висновку.
+
+Такий candidate можна показувати нижче.
+
+---
+
+# 12. AI + Embeddings
+
+AI-модуль бажано розділити на дві частини.
+
+### LLM
+
+Використовується для:
+
+```text
+query understanding
+query expansion
+intent classification
+promo detection
+semantic classification
+final reranking
+```
+
+### Embeddings
+
+Використовуються для:
+
+```text
+semantic similarity
+candidate retrieval
+similarity ranking
+```
+
+Поточний user query перетворюється в embedding.
+
+Контекст candidate також перетворюється в embedding.
+
+Після цього система визначає semantic similarity.
+
+Приклад:
+
+```text
+OnlyFans promotion
+        ↓
+embedding
+
+Creator Marketing Hub
+        ↓
+embedding
+
+Similarity = 0.91
+```
+
+Це дозволяє знаходити semantic matches навіть без exact keyword match.
+
+---
+
+# 13. AI не повинен виконувати
+
+AI **не повинен** відповідати за:
+
+```text
+Telegram API calls
+rate limits
+FloodWait handling
+pagination
+deduplication
+database persistence
+scheduler
+message sending
+user permissions
+```
+
+Це повинно залишатися на backend.
+
+AI — лише intelligence layer.
+
+---
+
+# 14. AI Fallback
+
+Система повинна працювати навіть без AI.
+
+Якщо:
+
+```text
+AI API unavailable
+AI timeout
+AI rate limit
+AI provider error
+```
+
+використовується fallback:
+
+```text
+keyword scoring
++
+rules
++
+activity score
++
+embedding cache (якщо доступний)
+```
+
+Таким чином проблема з AI не повинна зупиняти весь Discovery module.
+
+---
+
+# 15. Cost Optimization
+
+Не можна запускати LLM для кожного Telegram result.
+
+Обов'язковий pipeline:
+
+```text
+Telegram Search
+      ↓
+Deduplication
+      ↓
+Cheap rule-based filtering
+      ↓
+Activity filtering
+      ↓
+Top 30–50
+      ↓
+AI
+      ↓
+Top 10–20
+```
+
+AI повинен обробляти лише candidates, які вже пройшли базовий filter.
+
+Також потрібно кешувати:
+
+```text
+query expansion
+embeddings
+candidate classification
+```
+
+де це допустимо та корисно, щоб не повторювати однакові AI calls.
+
+---
+
+# 16. Structured AI Output
+
+AI не повинен повертати довільний текст для backend.
+
+Використовувати строго структурований JSON.
+
+Приклад:
+
+```json
+{
+  "query_analysis": {
+    "intent": "advertising_source",
+    "entities": [
+      "OnlyFans",
+      "Fansly",
+      "adult creators"
+    ],
+    "context_terms": [
+      "promotion",
+      "advertising",
+      "creator marketing",
+      "shoutout"
+    ]
+  },
+  "candidate_analysis": {
+    "relevance_score": 94,
+    "context_match_score": 96,
+    "promo_suitability_score": 92,
+    "confidence": 91,
+    "classification": "highly_relevant",
+    "is_advertising_source": true,
+    "reason": "Creator promotion community with recurring OnlyFans/Fansly promotional activity."
+  }
+}
+```
+
+Backend повинен валідовати AI response через schema validation.
+
+---
+
+# 17. AI Architecture
+
+Фінальна архітектура:
+
+```text
+User Query
+    ↓
+AI Query Understanding
+    ↓
+AI Query Expansion
+    ↓
+Telegram Search
+    ↓
+Candidate Collection
+    ↓
+Deduplication
+    ↓
+Rule-Based Filtering
+    ↓
+Activity Filtering
+    ↓
+Embeddings / Semantic Similarity
+    ↓
+Top 30–50
+    ↓
+AI Candidate Classification
+    ↓
+AI Reranking
+    ↓
+Final Results
+    ↓
+Supabase
+    ↓
+User Approval
+    ↓
+Existing Auto Posting
+```
+
+---
+
+# 18. AI Feature Requirements
+
+AI-функція вважається готовою, коли вона:
+
+* правильно визначає intent користувача;
+* розуміє сутності та тематику запиту;
+* генерує related search queries;
+* знаходить semantic equivalents та synonyms;
+* розрізняє content/community/advertising intent;
+* оцінює semantic relevance candidate;
+* окремо оцінює advertising/promo suitability;
+* знаходить positive та negative contextual signals;
+* відкидає тематично схожі, але непридатні для цільового завдання джерела;
+* повертає structured JSON;
+* повертає confidence;
+* може пояснити причину ranking;
+* працює тільки після попередньої фільтрації candidate;
+* має fallback без AI;
+* має timeout/retry/error handling;
+* не використовується для побудови глобальної бази або навчання моделі на масиві Telegram-даних.
+
+## Головний принцип
+
+**Telegram Search знаходить кандидатів. Backend фільтрує їх. Embeddings знаходять semantic similarity. AI розуміє intent і контекст та робить фінальну інтелектуальну оцінку.**
+
+Саме така роль AI дасть найбільший приріст якості без того, щоб зробити систему дорогою, повільною або залежною від LLM.

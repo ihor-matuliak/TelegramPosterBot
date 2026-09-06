@@ -1,0 +1,18 @@
+# Environment and secrets
+.env
+*.session
+*.session-journal
+
+# Python virtual environment & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

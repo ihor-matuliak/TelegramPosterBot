@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Auto-Poster | Панель Керування</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- Header -->
+    <header class="tg-header">
+        <div class="tg-brand">
+            <div class="tg-logo-icon">✈️</div>
+            <div>
+                <div class="tg-brand-title">
+                    <span>Telegram Auto-Poster</span>
+                    <span id="premiumBadge" class="premium-star" style="display: none;" title="Telegram Premium активний">⭐ Premium</span>
+                </div>
+                <div class="tg-brand-subtitle" id="userSubtitle">Підключення...</div>
+            </div>
+        </div>
+
+        <div class="header-controls">
+            <!-- Rate Limit Chips -->
+            <div class="rate-chip" title="Кількість відправлених постів за останню годину">
+                ⚡ <span id="rateHourly">0</span> / <strong id="limitHourly">30</strong> год
+            </div>
+            <div class="rate-chip" title="Кількість відправлених постів за сьогодні">
+                📅 <span id="rateDaily">0</span> / <strong id="limitDaily">300</strong> добу
+            </div>
+
+            <!-- Master Toggle Button -->
+            <button id="masterToggleBtn" class="master-toggle-btn paused">
+                <span class="status-dot"></span>
+                <span id="masterToggleText">Завантаження...</span>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <div class="main-container">
+        <!-- Sidebar Navigation -->
+        <aside class="tg-sidebar">
+            <button class="nav-item active" data-tab="chats">
+                <span>💬 Цільові чати</span>
+                <span id="chatsNavBadge" class="nav-badge">0</span>
+            </button>
+            <button class="nav-item" data-tab="finder">
+                <span>🔍 Пошук & Парсер чатів</span>
+            </button>
+            <button class="nav-item" data-tab="post">
+                <span>📝 Оголошення (Premium Emojis)</span>
+            </button>
+            <button class="nav-item" data-tab="settings">
+                <span>🛡️ Безпека & Анти-Флуд</span>
+            </button>
+            <button class="nav-item" data-tab="logs">
+                <span>📜 Журнал подій</span>
+            </button>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="tg-content">
+
+            <!-- TAB 1: CHATS -->
+            <div id="tab-chats" class="tab-pane active">
+                <!-- Stats Overview -->
+                <div class="stats-grid">
+                    <div class="stat-box">
+                        <div class="stat-label">Всього чатів</div>
+                        <div id="statTotalChats" class="stat-val">0</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Активні чати</div>
+                        <div id="statActiveChats" class="stat-val" style="color: var(--accent-green);">0</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-label">Помилки / Бан</div>
+                        <div id="statErrorChats" class="stat-val" style="color: var(--accent-red);">0</div>
+                    </div>
+                </div>
+
+                <!-- Chats Table Card -->
+                <div class="tg-card">
+                    <div class="card-header">
+                        <div class="card-title">Список підключених чатів для розсилки</div>
+                        <div style="display: flex; gap: 10px;">
+                            <button id="openBatchModalBtn" class="tg-btn tg-btn-secondary">📋 Імпорт списком</button>
+                            <button id="openAddChatModalBtn" class="tg-btn tg-btn-primary">+ Додати чат</button>
+                        </div>
+                    </div>
+
+                    <div class="table-responsive">
+                        <table class="tg-table">
+                            <thead>
+                                <tr>
+                                    <th>Назва / Посилання</th>
+                                    <th>Username / Peer</th>
+                                    <th>Варіант поста</th>
+                                    <th>Інтервал</th>
+                                    <th>Статус</th>
+                                    <th>Наступний пост</th>
+                                    <th>Дії</th>
+                                </tr>
+                            </thead>
+                            <tbody id="chatsTableBody">
+                                <tr>
+                                    <td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 30px;">
+                                        Завантаження списку чатів...
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB: CONTEXTUAL AI DISCOVERY & QUALIFICATION -->
+            <div id="tab-finder" class="tab-pane">
+                <div class="tg-card">
+                    <div class="card-header">
+                        <div class="card-title">🧠 Розумний AI Discovery & Кваліфікація чатів Telegram</div>
+                        <span class="badge" style="background: rgba(36, 129, 204, 0.15); color: var(--accent-blue-hover); border: 1px solid var(--accent-blue);">
+                            ⚡ Gemini 3.5 Flash Lite + Multi-Model Fallback
+                        </span>
+                    </div>
+
+                    <p style="color: var(--text-secondary); font-size: 13.5px; margin-bottom: 16px; line-height: 1.5;">
+                        Опишіть людською мовою, які чати ви шукаєте (наприклад: <i>«OnlyFans Fansly advertising groups»</i>, <i>«меблі барахолка київ»</i>, <i>«арбітраж трафіку чати»</i>). AI самостійно визначить інтент, розгорне підзапити, знайде відкриті групи через Telegram API, відсіє вже додані та розрахує точну семантичну відповідність.
+                    </p>
+
+                    <!-- Search Box -->
+                    <form id="finderSearchForm" style="display: flex; gap: 12px; margin-bottom: 12px;">
+                        <input type="text" id="finderQueryInput" class="tg-input" placeholder="Введіть пошуковий інтент (наприклад: OnlyFans Fansly promo groups, меблі оголошення...)" required style="flex: 1;">
+                        
+                        <select id="finderDefaultInterval" class="tg-select" style="width: 190px;">
+                            <option value="60">Інтервал: 1 год</option>
+                            <option value="120">Інтервал: 2 год</option>
+                            <option value="1440" selected>Інтервал: 1 доба</option>
+                            <option value="4320">Інтервал: 3 дні</option>
+                        </select>
+
+                        <button type="submit" id="finderSubmitBtn" class="tg-btn tg-btn-primary" style="white-space: nowrap; padding: 0 20px;">
+                            🧠 Знайти та кваліфікувати
+                        </button>
+                    </form>
+
+                    <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 8px;">
+                        <span style="font-size: 12.5px; color: var(--text-secondary);">Варіант поста для знайдених груп:</span>
+                        <select id="finderDefaultPost" class="tg-select" style="max-width: 280px; padding: 6px 12px; font-size: 13px;">
+                            <option value="default">⭐️ За замовчуванням (Основне)</option>
+                        </select>
+                    </div>
+
+                    <!-- Quick Suggestions -->
+                    <div class="pills-container">
+                        <span style="font-size: 12px; color: var(--text-muted); align-self: center;">Популярні ніші:</span>
+                        <span class="search-pill" onclick="setFinderQuery('OnlyFans Fansly advertising promo groups')">🔞 OnlyFans & Fansly Promo</span>
+                        <span class="search-pill" onclick="setFinderQuery('меблі барахолка оголошення україна')">🛋️ Меблі & Інтер'єр</span>
+                        <span class="search-pill" onclick="setFinderQuery('квіти подарунки дошка оголошень')">💐 Квіти & Подарунки</span>
+                        <span class="search-pill" onclick="setFinderQuery('арбітраж трафіку реклама маркетинг')">📈 Трафік & Маркетинг</span>
+                        <span class="search-pill" onclick="setFinderQuery('барахолка київ продаж речей')">📦 Барахолка Київ</span>
+                        <span class="search-pill" onclick="setFinderQuery('послуги та робота україна')">🛠️ Послуги & Оголошення</span>
+                    </div>
+
+                    <!-- Progress Stepper (Hidden by default) -->
+                    <div id="discoveryStepper" style="display: none; margin-top: 20px; padding: 16px; background: rgba(23, 33, 43, 0.7); border: 1px solid var(--border-color); border-radius: var(--radius-md);">
+                        <div style="display: flex; justify-content: space-between; font-size: 12.5px; color: var(--text-secondary);">
+                            <div id="step-1" class="discovery-step active">🧠 1. AI аналіз інтенту</div>
+                            <div id="step-2" class="discovery-step">📡 2. Пошук у Telegram</div>
+                            <div id="step-3" class="discovery-step">📐 3. Векторні Embeddings</div>
+                            <div id="step-4" class="discovery-step">⭐ 4. AI-ранжування</div>
+                        </div>
+                        <div class="discovery-progress-bar" style="margin-top: 10px; height: 4px; background: var(--bg-tertiary); border-radius: 2px; overflow: hidden;">
+                            <div id="discoveryProgressFill" style="width: 25%; height: 100%; background: linear-gradient(90deg, var(--accent-blue), #a855f7); transition: width 0.4s ease;"></div>
+                        </div>
+                        <div id="discoveryStatusText" style="margin-top: 8px; font-size: 12px; color: var(--accent-blue-hover); text-align: center;">
+                            AI аналізує запит та генерує семантичні підзапити...
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Search Results Card -->
+                <div id="finderResultsCard" class="tg-card" style="display: none;">
+                    <div class="card-header" style="flex-wrap: wrap; gap: 12px;">
+                        <div>
+                            <div class="card-title" id="finderResultsCountTitle">Кваліфіковані результати (0)</div>
+                            <div id="finderExclusionNote" style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">
+                                🛡️ Усі вже додані до вашої розсилки чати автоматично виключені.
+                            </div>
+                        </div>
+
+                        <!-- Filters & Sorting Bar -->
+                        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                            <div style="display: flex; gap: 6px;">
+                                <button type="button" class="filter-chip active" data-filter="all" onclick="setDiscoveryFilter('all')">Всі</button>
+                                <button type="button" class="filter-chip" data-filter="group" onclick="setDiscoveryFilter('group')">👥 Групи (можна писати)</button>
+                                <button type="button" class="filter-chip" data-filter="channel" onclick="setDiscoveryFilter('channel')">📢 Канали</button>
+                            </div>
+
+                            <button type="button" id="batchAddFoundBtn" class="tg-btn tg-btn-purple tg-btn-sm" style="display: none;">
+                                📥 Додати всі вибрані (<span id="selectedCountSpan">0</span>)
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Cards Container -->
+                    <div id="discoveryCardsGrid" class="discovery-grid">
+                        <!-- Rendered by app.js -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 2: POST EDITOR & PREVIEW (MULTI-TEMPLATES & PREMIUM EMOJIS) -->
+            <div id="tab-post" class="tab-pane">
+                <div class="tg-card">
+                    <div class="card-header">
+                        <div>
+                            <div class="card-title">📝 Керування варіантами оголошень</div>
+                            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
+                                Створюйте окремі шаблони під різні типи пабліків та закріплюйте їх за чатами
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 10px;">
+                            <button type="button" id="fetchSavedMsgBtn" class="tg-btn tg-btn-purple">
+                                ⭐ 📥 Завантажити зі «Збережених»
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Post Variant Navigation Tabs -->
+                    <div id="postTabsContainer" class="post-tabs-container">
+                        <!-- Generated dynamically by app.js -->
+                    </div>
+
+                    <div style="background-color: rgba(168, 85, 247, 0.1); border-left: 3px solid #a855f7; padding: 12px 16px; border-radius: var(--radius-md); font-size: 13px; color: var(--text-primary); margin-bottom: 16px;">
+                        💡 <strong>Підтримка Telegram Premium кастомних емодзі:</strong> Надішліть готове оголошення у ваші <strong>«Збережені повідомлення» (Saved Messages)</strong> в Telegram та натисніть кнопку «Завантажити зі Збережених». Система збереже його як окремий варіант із 100% підтримкою анімованих емодзі та формату!
+                    </div>
+
+                    <div class="preview-container">
+                        <!-- Editor Form -->
+                        <form id="postEditForm" class="editor-col">
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Назва шаблону / призначення:</label>
+                                <input type="text" id="postTitle" class="tg-input" placeholder="Наприклад: Оголошення для крипто-чатів" required>
+                            </div>
+
+                            <div>
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                    <label style="font-size: 13px; color: var(--text-secondary);">
+                                        Текст оголошення (HTML / Преміум емодзі / Spintax {a|b}):
+                                    </label>
+                                    <button type="button" id="testSpintaxBtn" class="tg-btn tg-btn-secondary tg-btn-sm">
+                                        🎲 Згенерувати варіант Spintax
+                                    </button>
+                                </div>
+                                <textarea id="postContent" class="tg-textarea" style="min-height: 240px;" placeholder="Введіть текст або завантажте зі збережених..." required></textarea>
+                            </div>
+
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                <button type="submit" class="tg-btn tg-btn-primary" style="flex: 1.5; padding: 12px;">💾 Зберегти зміни</button>
+                                <button type="button" id="setDefaultPostBtn" class="tg-btn tg-btn-secondary" style="flex: 1; padding: 12px;">⭐️ Зробити основним</button>
+                                <button type="button" id="deletePostBtn" class="tg-btn tg-btn-danger" style="padding: 12px 16px;" title="Видалити варіант">🗑️</button>
+                            </div>
+                        </form>
+
+                        <!-- Telegram Live Message Preview -->
+                        <div class="preview-col">
+                            <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; align-self: flex-start;">
+                                👁️ Превʼю в чаті Telegram:
+                            </div>
+
+                            <div class="tg-message-bubble">
+                                <div id="previewContent">Тут буде відображатися превʼю вашого оголошення...</div>
+                                <div class="tg-message-meta">
+                                    <span id="previewTime">12:00</span>
+                                    <span class="tg-ticks">✓✓</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Post Assigned Chats Section -->
+                    <div id="postAssignedChatsSection" style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-subtle);">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px;">
+                            <div>
+                                <div style="font-weight: 600; font-size: 14px; color: var(--text-primary);">
+                                    👥 Прикріплені чати для цього варіанту (<span id="postAssignedCount">0</span>)
+                                </div>
+                                <div style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
+                                    Клікніть по чату, щоб закріпити або відкріпити цей варіант для нього
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 8px;">
+                                <button type="button" id="assignAllChatsToThisPostBtn" class="tg-btn tg-btn-secondary tg-btn-sm">⚡ Призначити на всі чати</button>
+                                <button type="button" id="unassignAllChatsFromThisPostBtn" class="tg-btn tg-btn-secondary tg-btn-sm">🔄 Скинути з усіх</button>
+                            </div>
+                        </div>
+
+                        <!-- Checkbox Grid of chats -->
+                        <div id="postChatsAssignmentGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; max-height: 240px; overflow-y: auto; padding: 4px;">
+                            <!-- Filled dynamically by app.js -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 3: ADVANCED ANTI-BAN & SECURITY SETTINGS -->
+            <div id="tab-settings" class="tab-pane">
+                <form id="settingsForm" style="display: flex; flex-direction: column; gap: 20px; max-width: 850px;">
+                    
+                    <!-- 1. Delays & Jitter -->
+                    <div class="tg-card">
+                        <div class="card-header">
+                            <div class="card-title">⏱️ 1. Затримки між чатами та Джиттер</div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Мін. пауза між чатами (сек):</label>
+                                <input type="number" id="minDelayInput" class="tg-input" min="5" max="120" value="15">
+                            </div>
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Макс. пауза між чатами (сек):</label>
+                                <input type="number" id="maxDelayInput" class="tg-input" min="10" max="300" value="35">
+                            </div>
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Джиттер відхилення (± хв):</label>
+                                <input type="number" id="jitterInput" class="tg-input" min="0" max="30" value="3">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 2. Rate Limits & Rest Batches -->
+                    <div class="tg-card">
+                        <div class="card-header">
+                            <div class="card-title">📊 2. Ліміти швидкості та Захисні паузи (Batch Rest)</div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Ліміт постів за 1 годину (на всі чати, до 30):</label>
+                                <input type="number" id="maxHourlyInput" class="tg-input" min="1" max="60" value="30">
+                            </div>
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Ліміт постів за 1 добу (на всі чати, до 300):</label>
+                                <input type="number" id="maxDailyInput" class="tg-input" min="10" max="500" value="300">
+                            </div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Розмір пачки постів (постів підряд, наприклад 8):</label>
+                                <input type="number" id="batchSizeInput" class="tg-input" min="2" max="30" value="8">
+                            </div>
+                            <div>
+                                <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Тривалість захисного відпочинку (хв):</label>
+                                <input type="number" id="batchRestInput" class="tg-input" min="1" max="60" value="8">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 3. Human Behavior & Anti-Fingerprint -->
+                    <div class="tg-card">
+                        <div class="card-header">
+                            <div class="card-title">🤖 3. Імітація живої людини та Анти-Фінґерпринт</div>
+                        </div>
+                        <div style="display: flex; flex-direction: column; gap: 12px;">
+                            <div class="tg-switch-row">
+                                <div>
+                                    <div style="font-weight: 600; font-size: 14px;">Імітація дії «Друкує...» (Typing Action)</div>
+                                    <div style="font-size: 12px; color: var(--text-secondary);">Посилає статус набору тексту в чат перед публікацією</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" id="enableTypingInput" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="tg-switch-row">
+                                <div>
+                                    <div style="font-weight: 600; font-size: 14px;">Анти-Хеш рандомізація (Zero-Width Anti-Fingerprint)</div>
+                                    <div style="font-size: 12px; color: var(--text-secondary);">Додає невидимі юнікод-символи, щоб кожне повідомлення мало унікальний хеш і не блокувалося антиспамом</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" id="enableAntiFingerprintInput" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="tg-switch-row">
+                                <div>
+                                    <div style="font-weight: 600; font-size: 14px;">Генератор варіацій Spintax {a|b|c}</div>
+                                    <div style="font-size: 12px; color: var(--text-secondary);">Автоматично генерує різні комбінації тексту для кожного чату</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" id="enableSpintaxInput" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 4. Schedule & Emergency Circuit Breaker -->
+                    <div class="tg-card">
+                        <div class="card-header">
+                            <div class="card-title">🌙 4. Режим сну та Аварійний вимикач (Circuit Breaker)</div>
+                        </div>
+                        <div style="display: flex; flex-direction: column; gap: 14px;">
+                            <div class="tg-switch-row">
+                                <div>
+                                    <div style="font-weight: 600; font-size: 14px;">Нічний режим відпочинку (Sleep Mode)</div>
+                                    <div style="font-size: 12px; color: var(--text-secondary);">Призупиняти постінг у встановлений інтервал годин (наприклад з 1:00 до 8:00)</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" id="enableNightModeInput">
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                                <div>
+                                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Початок режиму сну (година від 0 до 23, наприклад 1 для 1:00):</label>
+                                    <input type="number" id="nightStartInput" class="tg-input" min="0" max="23" value="1">
+                                </div>
+                                <div>
+                                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">Кінець режиму сну (година від 0 до 23, наприклад 8 для 8:00):</label>
+                                    <input type="number" id="nightEndInput" class="tg-input" min="0" max="23" value="8">
+                                </div>
+                            </div>
+
+                            <div class="tg-switch-row">
+                                <div>
+                                    <div style="font-weight: 600; font-size: 14px;">Аварійний запобіжник (Auto Circuit Breaker)</div>
+                                    <div style="font-size: 12px; color: var(--text-secondary);">Автоматично ставити розсилку на паузу при 3 помилках підряд для захисту акаунту</div>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" id="circuitBreakerInput" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="tg-btn tg-btn-primary" style="padding: 14px; font-size: 15px;">
+                        💾 Зберегти всі налаштування безпеки
+                    </button>
+                </form>
+            </div>
+
+            <!-- TAB 5: LOGS -->
+            <div id="tab-logs" class="tab-pane">
+                <div class="tg-card">
+                    <div class="card-header">
+                        <div class="card-title">Останні події, відправки та захисні паузи</div>
+                        <button class="tg-btn tg-btn-secondary tg-btn-sm" onclick="fetchLogs()">🔄 Оновити</button>
+                    </div>
+
+                    <div id="logsFeed" class="logs-feed">
+                        <!-- Filled by JS -->
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- MODAL: ADD SINGLE CHAT -->
+    <div id="addChatModal" class="modal-overlay">
+        <div class="tg-modal">
+            <div class="modal-title">Додати новий цільовий чат</div>
+            <form id="addChatForm" style="display: flex; flex-direction: column; gap: 14px;">
+                <div>
+                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
+                        Username або посилання на чат:
+                    </label>
+                    <input type="text" id="chatPeerInput" class="tg-input" placeholder="@example_group або https://t.me/example" required>
+                </div>
+
+                <div>
+                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
+                        Інтервал публікацій у цьому чаті:
+                    </label>
+                    <select id="chatIntervalSelect" class="tg-select">
+                        <option value="60">1 година (60 хв)</option>
+                        <option value="120">2 години (120 хв)</option>
+                        <option value="360">6 годин (360 хв)</option>
+                        <option value="720">12 годин (720 хв)</option>
+                        <option value="1440">1 доба (24 години)</option>
+                        <option value="2880">2 дні (48 годин)</option>
+                        <option value="4320">3 дні (72 години)</option>
+                        <option value="10080">7 днів (1 тиждень)</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
+                        Варіант оголошення для цього чату:
+                    </label>
+                    <select id="chatPostSelect" class="tg-select">
+                        <option value="default">⭐️ За замовчуванням (Основне)</option>
+                    </select>
+                </div>
+
+                <div class="modal-actions">
+                    <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Скасувати</button>
+                    <button type="submit" class="tg-btn tg-btn-primary">Додати чат</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: BATCH IMPORT -->
+    <div id="batchModal" class="modal-overlay">
+        <div class="tg-modal">
+            <div class="modal-title">Масовий імпорт списку чатів</div>
+            <form id="batchChatForm" style="display: flex; flex-direction: column; gap: 14px;">
+                <div>
+                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
+                        Вставте список посилань / юзернеймів (по 1 в рядок):
+                    </label>
+                    <textarea id="batchLinksInput" class="tg-textarea" style="min-height: 160px;" placeholder="@chat1&#10;@chat2&#10;https://t.me/chat3" required></textarea>
+                </div>
+
+                <div>
+                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
+                        Інтервал для всіх цих чатів:
+                    </label>
+                    <select id="batchIntervalSelect" class="tg-select">
+                        <option value="60">1 година (60 хв)</option>
+                        <option value="120">2 години (120 хв)</option>
+                        <option value="1440">1 доба (24 години)</option>
+                        <option value="4320">3 дні (72 години)</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
+                        Варіант оголошення для цих чатів:
+                    </label>
+                    <select id="batchPostSelect" class="tg-select">
+                        <option value="default">⭐️ За замовчуванням (Основне)</option>
+                    </select>
+                </div>
+
+                <div class="modal-actions">
+                    <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Скасувати</button>
+                    <button type="submit" class="tg-btn tg-btn-primary">Імпортувати всі</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
