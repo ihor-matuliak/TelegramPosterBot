@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 import uvicorn
 from config import config
 from core.client import init_telegram_client
@@ -12,7 +13,8 @@ app = web_app
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] (%(name)s) %(message)s"
+    format="%(asctime)s [%(levelname)s] (%(name)s) %(message)s",
+    stream=sys.stdout
 )
 logger = logging.getLogger("MainOrchestrator")
 
