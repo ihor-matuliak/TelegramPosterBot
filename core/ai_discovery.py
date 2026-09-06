@@ -3,6 +3,8 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 import numpy as np
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 import google.generativeai as genai
 from config import config
 
