@@ -20,21 +20,14 @@ class SupabaseDB:
         self._init_client()
 
     def _init_client(self):
-        url = (config.SUPABASE_URL or os.getenv("SUPABASE_URL", "")).strip().strip('"').strip("'")
-        key = (config.SUPABASE_KEY or os.getenv("SUPABASE_KEY", "")).strip().strip('"').strip("'")
-        if not url or not key:
-            logger.error(f"Supabase URL or Key not set in configuration! (URL={'set' if url else 'empty'}, KEY={'set' if key else 'empty'})")
+        if not config.SUPABASE_URL or not config.SUPABASE_KEY:
+            logger.error("Supabase URL or Key not set in configuration!")
             return
         try:
-            self.client = create_client(url, key)
+            self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
             logger.info("Supabase client successfully initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize Supabase client: {e}")
-
-    def _ensure_client(self) -> bool:
-        if not self.client:
-            self._init_client()
-        return bool(self.client)
 
     # ==================== LOCAL PERSISTENCE HELPERS ====================
 
@@ -65,7 +58,7 @@ class SupabaseDB:
 
     def get_all_chats(self) -> List[Dict[str, Any]]:
         """Retrieve all registered target chats with post assignments."""
-        if not self._ensure_client():
+        if not self.client:
             return []
         try:
             res = self.client.table("chats").select("*").order("created_at", desc=False).execute()

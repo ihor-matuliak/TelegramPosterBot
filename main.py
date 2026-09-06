@@ -33,8 +33,6 @@ async def run_fastapi():
 async def main():
     logger.info("=" * 60)
     logger.info("🚀 Запуск комплексу Telegram Auto-Poster...")
-    found_keys = [k for k in sorted(os.environ.keys()) if any(x in k for x in ["TELEGRAM", "SUPABASE", "BOT", "GEMINI", "WEB", "PORT", "RAILWAY"])]
-    logger.info(f"🔍 Знайдені змінні оточення у контейнері: {found_keys}")
     logger.info("=" * 60)
 
     # 1. Initialize Telegram Userbot client
