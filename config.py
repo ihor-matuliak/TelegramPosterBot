@@ -35,8 +35,8 @@ class Config:
     SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 
     # Web Dashboard
-    WEB_HOST: str = os.getenv("WEB_HOST", "127.0.0.1")
-    WEB_PORT: int = int(os.getenv("WEB_PORT", "8000"))
+    WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")
+    WEB_PORT: int = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8000")
 
 
 config = Config()

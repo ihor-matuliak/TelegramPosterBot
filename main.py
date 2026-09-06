@@ -7,6 +7,9 @@ from core.poster import poster_worker
 from web.api import web_app
 from bot.admin_bot import run_admin_bot
 
+# ASGI app instance (required by platforms like Vercel)
+app = web_app
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] (%(name)s) %(message)s"

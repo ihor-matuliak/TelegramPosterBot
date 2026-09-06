@@ -8,14 +8,16 @@ from telethon.tl.types import (
 )
 from telethon.tl.functions.messages import SetTypingRequest
 from telethon.extensions import html
+from telethon.sessions import StringSession
 from config import config, BASE_DIR
 
 logger = logging.getLogger("TelegramClient")
 
-SESSION_PATH = str(BASE_DIR / config.TELEGRAM_SESSION_NAME)
+string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip()
+SESSION_TARGET = StringSession(string_session) if string_session else str(BASE_DIR / config.TELEGRAM_SESSION_NAME)
 
 client = TelegramClient(
-    SESSION_PATH,
+    SESSION_TARGET,
     api_id=config.TELEGRAM_API_ID,
     api_hash=config.TELEGRAM_API_HASH,
     device_model="Desktop PC",
