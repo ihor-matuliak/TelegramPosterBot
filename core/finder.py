@@ -1,239 +1,179 @@
+"""Telegram discovery transport. Searching never joins groups or sends messages."""
+
 import asyncio
 import logging
-import re
-from typing import List, Dict, Any, Optional, Set
+import random
+import time
+from datetime import timezone
+from typing import Any, AsyncIterator, Awaitable, Callable
+
+from telethon import errors, utils
+from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.messages import SearchGlobalRequest
-from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
-from telethon.tl.types import (
-    Channel,
-    Chat,
-    InputPeerChannel,
-    InputPeerChat,
-    InputMessagesFilterEmpty
-)
+from telethon.tl.types import Channel, InputMessagesFilterEmpty, InputPeerEmpty
+
+from config import config
 from core.client import client
-from core.ai_discovery import AIDiscoveryEngine
+from core.discovery_relevance import clean_text
 from database.client import db
 
 logger = logging.getLogger("ChatFinder")
 
 
-class ChatFinder:
-    @staticmethod
-    async def join_and_add_chat(peer_str: str, interval_minutes: int = 60, title: str = "", post_id: Optional[str] = None) -> Dict[str, Any]:
-        """Join a Telegram public group and add it to the poster schedule."""
-        if not client.is_connected() or not await client.is_user_authorized():
-            return {"status": "error", "message": "Telegram клієнт не авторизований"}
+class TelegramDiscovery:
+    def __init__(self, telegram: Any, on_wait: Callable[[int, str], Awaitable[None]]) -> None:
+        self.client = telegram
+        self.on_wait = on_wait
+        self._next_call = 0.0
+        self._lock = asyncio.Lock()
 
-        peer_str = peer_str.strip()
-        if not peer_str.startswith("@") and not peer_str.startswith("http") and not peer_str.startswith("-"):
-            peer_str = f"@{peer_str}"
+    async def ready(self) -> bool:
+        return self.client.is_connected() and await self.client.is_user_authorized()
 
-        try:
-            entity = await client.get_entity(peer_str)
-            resolved_title = getattr(entity, "title", title or peer_str)
-
-            if isinstance(entity, Channel):
+    async def call(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        async with self._lock:
+            failures = 0
+            waited = False
+            while True:
+                await asyncio.sleep(max(0, self._next_call - time.monotonic()))
                 try:
-                    await client(JoinChannelRequest(entity))
-                    logger.info(f"Successfully joined {peer_str}")
-                except Exception as join_err:
-                    logger.warning(f"Could not join {peer_str} (might be already member or restricted): {join_err}")
+                    result = await asyncio.wait_for(operation(), timeout=40)
+                    if waited:
+                        await self.on_wait(0, "З’єднання відновлено. Продовжуємо пошук.")
+                    return result
+                except errors.FloodWaitError as exc:
+                    delay = exc.seconds + 3
+                    await self.on_wait(delay, "Telegram обмежив запити. Очікуємо дозволеного часу.")
+                    await asyncio.sleep(delay)
+                    waited = True
+                except (OSError, asyncio.TimeoutError, errors.ServerError):
+                    failures += 1
+                    delay = min(300, 30 * 2 ** min(failures - 1, 4))
+                    await self.on_wait(delay, "Тимчасова помилка Telegram. Повторимо запит після паузи.")
+                    await asyncio.sleep(delay)
+                    waited = True
+                finally:
+                    self._next_call = time.monotonic() + random.uniform(
+                        config.DISCOVERY_RPC_MIN_SECONDS, config.DISCOVERY_RPC_MAX_SECONDS,
+                    )
 
-            res = db.add_chat(peer_str, interval_minutes=interval_minutes, title=resolved_title, post_id=post_id)
-            if res:
-                return {
-                    "status": "ok",
-                    "message": f"Чат '{resolved_title}' успішно додано до розсилки!",
-                    "chat": res
-                }
-            else:
-                return {"status": "error", "message": "Не вдалося зберегти чат у базі даних"}
-
-        except Exception as e:
-            logger.error(f"Error joining/adding chat {peer_str}: {e}")
-            return {"status": "error", "message": f"Помилка: {str(e)}"}
-
-    @classmethod
-    async def search_single_query(
-        cls,
-        query: str,
-        limit: int = 30,
-        excluded_peers: Optional[Set[str]] = None
-    ) -> List[Dict[str, Any]]:
-        """Search Telegram public groups and channels by keyword query."""
-        if not client.is_connected() or not await client.is_user_authorized():
-            return []
-
-        query = query.strip()
-        if not query:
-            return []
-
-        excluded = excluded_peers or set()
-        candidates = []
-        seen_ids = set()
-
-        try:
-            # 1. Directory Search (contacts.Search)
-            try:
-                search_res = await client(SearchRequest(q=query, limit=limit))
-                for chat in search_res.chats:
-                    cand = cls._parse_telegram_chat(chat, query, excluded)
-                    if cand and cand["id"] not in seen_ids:
-                        seen_ids.add(cand["id"])
-                        candidates.append(cand)
-            except Exception as dir_err:
-                logger.warning(f"Directory search error for '{query}': {dir_err}")
-
-            # 2. Global Messages Search (messages.SearchGlobal)
-            try:
-                msg_res = await client(SearchGlobalRequest(
-                    q=query,
-                    filter=InputMessagesFilterEmpty(),
-                    min_date=None,
-                    max_date=None,
-                    offset_rate=0,
-                    offset_peer=InputPeerChannel(0, 0) if False else None,
-                    offset_id=0,
-                    limit=min(20, limit)
-                ))
-                if hasattr(msg_res, "chats"):
-                    for chat in msg_res.chats:
-                        cand = cls._parse_telegram_chat(chat, query, excluded)
-                        if cand and cand["id"] not in seen_ids:
-                            seen_ids.add(cand["id"])
-                            candidates.append(cand)
-            except Exception as msg_err:
-                logger.debug(f"Global message search notice for '{query}': {msg_err}")
-
-            return candidates
-        except Exception as e:
-            logger.error(f"Error in search_single_query for '{query}': {e}")
-            return []
-
-    @classmethod
-    def _parse_telegram_chat(cls, chat: Any, matched_query: str, excluded_peers: Set[str]) -> Optional[Dict[str, Any]]:
-        """Extract and normalize candidate chat metadata."""
-        username = getattr(chat, "username", None)
-        if not username:
+    @staticmethod
+    def parse(chat: Any, query: str) -> dict[str, Any] | None:
+        if not isinstance(chat, Channel) or not chat.username:
             return None
-
-        peer_str = f"@{username}"
-        clean_peer = username.lower()
-        if peer_str.lower() in excluded_peers or clean_peer in excluded_peers:
-            return None
-
-        is_group = False
-        can_post = True
-        chat_type = "channel"
-        participants_count = getattr(chat, "participants_count", 0) or 0
-        title = getattr(chat, "title", username)
-
-        if isinstance(chat, Channel):
-            if chat.megagroup or getattr(chat, "gigagroup", False):
-                is_group = True
-                chat_type = "group"
-            else:
-                is_group = False
-                chat_type = "channel"
-                can_post = False
-
-            if hasattr(chat, "default_banned_rights") and chat.default_banned_rights:
-                if chat.default_banned_rights.send_messages:
-                    can_post = False
-
-        elif isinstance(chat, Chat):
-            is_group = True
-            chat_type = "group"
-        else:
-            return None
-
+        group = bool(chat.megagroup and not getattr(chat, "gigagroup", False))
+        rights = getattr(chat, "default_banned_rights", None)
+        restricted = bool(rights and (rights.send_messages or rights.view_messages or getattr(rights, "send_plain", False)))
+        own_rights = getattr(chat, "banned_rights", None)
+        restricted = restricted or bool(own_rights and (own_rights.send_messages or own_rights.view_messages or getattr(own_rights, "send_plain", False)))
+        access = "restricted" if not group or restricted else "join_required" if chat.left else "writable"
+        if getattr(chat, "join_request", False) and chat.left:
+            access = "approval_required"
         return {
-            "id": chat.id,
-            "title": title,
-            "username": username,
-            "peer": peer_str,
-            "type": chat_type,
-            "is_group": is_group,
-            "can_post": can_post,
-            "participants_count": participants_count,
-            "matched_query": matched_query,
-            "description": ""
+            "telegram_id": utils.get_peer_id(chat), "peer": f"@{chat.username}",
+            "title": clean_text(chat.title), "type": "group" if group else "channel",
+            "participants_count": getattr(chat, "participants_count", None),
+            "can_post": access == "writable", "posting_access": access,
+            "matched_query": query, "description": "", "messages": [], "last_message_at": None,
+            "_entity": chat,
         }
 
-    @classmethod
-    async def run_contextual_discovery(
-        cls,
-        user_query: str,
-        search_id: str,
-        max_total_candidates: int = 40
-    ) -> List[Dict[str, Any]]:
-        """
-        Full End-to-End Contextual Discovery:
-        AI Expansion -> Telegram Search -> Exclusion Filter -> Embeddings & Reranker -> Supabase Persistence.
-        """
-        logger.info(f"Starting contextual discovery for search #{search_id} with query: '{user_query}'")
-        db.update_discovery_search(search_id, {"status": "searching"})
+    async def search(self, query: str, cursor: dict[str, Any]) -> AsyncIterator[tuple[list[dict[str, Any]], dict[str, Any] | None]]:
+        directory = await self.call(lambda: self.client(SearchRequest(q=query, limit=50), flood_sleep_threshold=0))
+        yield [c for chat in directory.chats if (c := self.parse(chat, query))], None
+        offset_peer: Any = InputPeerEmpty()
+        if cursor.get("peer"):
+            try:
+                offset_peer = await self.call(lambda: self.client.get_input_entity(cursor["peer"]))
+            except (ValueError, errors.UsernameInvalidError, errors.UsernameNotOccupiedError, errors.ChannelPrivateError):
+                cursor = {}
+        offset_id, offset_rate = cursor.get("id", 0), cursor.get("rate", 0)
+        # Visit a bounded number of pages per query; persist the cursor for the next cycle.
+        for _ in range(2):
+            response = await self.call(lambda: self.client(SearchGlobalRequest(
+                q=query, filter=InputMessagesFilterEmpty(), min_date=None, max_date=None,
+                offset_rate=offset_rate, offset_peer=offset_peer, offset_id=offset_id,
+                limit=30, groups_only=True,
+            ), flood_sleep_threshold=0))
+            messages = [m for m in response.messages if getattr(m, "peer_id", None) and getattr(m, "date", None)]
+            peers = {utils.get_peer_id(m.peer_id) for m in messages if getattr(m, "peer_id", None)}
+            chats = {utils.get_peer_id(chat): chat for chat in response.chats}
+            candidates = [c for key, chat in chats.items() if key in peers and (c := self.parse(chat, query))]
+            if not messages:
+                yield candidates, {}
+                return
+            last = messages[-1]
+            entity = chats.get(utils.get_peer_id(last.peer_id))
+            if not entity or not getattr(entity, "username", None):
+                yield candidates, {}
+                return
+            new_rate = getattr(response, "next_rate", None) or int(last.date.timestamp())
+            new_cursor = {"peer": f"@{entity.username}", "id": last.id, "rate": new_rate}
+            if new_cursor == cursor:
+                yield candidates, {}
+                return
+            yield candidates, new_cursor
+            cursor = new_cursor
+            offset_peer = utils.get_input_peer(entity)
+            offset_id, offset_rate = last.id, new_rate
 
-        # 1. Exclude already added chats
-        excluded_peers = db.get_existing_peers_set()
-        logger.info(f"Exclusion list contains {len(excluded_peers)} chats.")
+    async def enrich(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        if candidate["type"] != "group":
+            return candidate
+        entity = candidate.get("_entity")
+        if entity is None:
+            try:
+                entity = await self.call(lambda: self.client.get_entity(candidate["telegram_id"]))
+            except ValueError:
+                entity = await self.call(lambda: self.client.get_entity(candidate["peer"]))
+            if utils.get_peer_id(entity) != candidate["telegram_id"]:
+                # A username may now belong to a different group; do not mix their evidence.
+                return candidate
+        inaccessible = (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.UserBannedInChannelError)
+        try:
+            full = await self.call(lambda: self.client(GetFullChannelRequest(entity), flood_sleep_threshold=0))
+            candidate["description"] = clean_text(full.full_chat.about or "")[:2000]
+            count = getattr(full.full_chat, "participants_count", None)
+            if count is not None:
+                candidate["participants_count"] = count
+        except inaccessible:
+            candidate["posting_access"] = "unknown"
+            candidate["can_post"] = False
+        try:
+            messages = await self.call(lambda: self.client.get_messages(entity, limit=30))
+            candidate["messages"] = [clean_text(m.message)[:700] for m in messages if getattr(m, "message", None)]
+            dated = [m for m in messages if getattr(m, "date", None)]
+            if dated:
+                candidate["last_message_at"] = max(m.date for m in dated).astimezone(timezone.utc).isoformat()
+        except inaccessible:
+            pass
+        return candidate
 
-        # 2. AI Query Expansion via Gemini Flash Cascade
-        expansion = AIDiscoveryEngine.expand_query(user_query)
-        intent = expansion.get("intent", "advertising_source")
-        sub_queries = expansion.get("search_queries", [])
-        db.update_discovery_search(search_id, {"intent": intent})
-        db.save_discovery_queries(search_id, sub_queries)
 
-        # 3. Compute Query Embedding via Gemini
-        query_embedding = AIDiscoveryEngine.get_embedding(user_query)
-
-        # 4. Multi-query Telegram Search
-        raw_candidates_map = {}
-        queries_to_run = sub_queries[:6] if sub_queries else [{"text": user_query, "type": "primary"}]
-
-        for q_obj in queries_to_run:
-            q_text = q_obj.get("text", user_query)
-            logger.info(f"Searching Telegram for sub-query: '{q_text}'...")
-            found = await cls.search_single_query(q_text, limit=15, excluded_peers=excluded_peers)
-            for c in found:
-                if c["peer"].lower() not in raw_candidates_map:
-                    raw_candidates_map[c["peer"].lower()] = c
-            
-            # Anti-flood gentle pause between Telegram search queries
-            await asyncio.sleep(0.6)
-
-        raw_candidates = list(raw_candidates_map.values())
-        logger.info(f"Collected {len(raw_candidates)} unique unadded candidates.")
-        db.update_discovery_search(search_id, {
-            "status": "scoring",
-            "total_candidates": len(raw_candidates)
-        })
-
-        if not raw_candidates:
-            db.update_discovery_search(search_id, {
-                "status": "completed",
-                "total_candidates": 0,
-                "total_relevant": 0
-            })
-            return []
-
-        # 5. Batch Qualification & Vector Scoring via Gemini
-        scored_candidates = AIDiscoveryEngine.batch_qualify_candidates(
-            user_query=user_query,
-            query_embedding=query_embedding,
-            candidates=raw_candidates
-        )
-
-        # 6. Save ranked results to Supabase
-        relevant_count = sum(1 for c in scored_candidates if c.get("final_score", 0) >= 60)
-        db.save_discovery_results(search_id, scored_candidates)
-        db.update_discovery_search(search_id, {
-            "status": "completed",
-            "total_relevant": relevant_count
-        })
-
-        logger.info(f"Contextual discovery #{search_id} completed: {len(scored_candidates)} candidates scored ({relevant_count} highly relevant).")
-        return scored_candidates
+class ChatFinder:
+    @staticmethod
+    async def join_and_add_chat(peer_str: str, interval_minutes: int = 60, title: str = "",
+                                post_id: str | None = None) -> dict[str, Any]:
+        """Explicit user action only; never called by the discovery worker."""
+        if not client.is_connected() or not await client.is_user_authorized():
+            return {"status": "error", "message": "Telegram клієнт не авторизований"}
+        peer_str = peer_str.strip()
+        if not peer_str.startswith(("@", "http", "-")):
+            peer_str = f"@{peer_str}"
+        try:
+            entity = await client.get_entity(peer_str)
+            if isinstance(entity, Channel) and entity.left:
+                await client(JoinChannelRequest(entity), flood_sleep_threshold=0)
+            saved = await asyncio.to_thread(db.add_chat, peer_str, interval_minutes=interval_minutes,
+                                            title=getattr(entity, "title", title or peer_str), post_id=post_id)
+            if not saved:
+                return {"status": "error", "message": "Не вдалося зберегти чат у базі даних"}
+            return {"status": "ok", "message": "Чат додано до розсилки", "chat": saved}
+        except errors.FloodWaitError as exc:
+            return {"status": "error", "message": f"Telegram просить зачекати {exc.seconds} с перед вступом.", "retry_after": exc.seconds}
+        except errors.InviteRequestSentError:
+            return {"status": "error", "message": "Заявку на вступ надіслано. Дочекайтеся схвалення адміністратора."}
+        except Exception as exc:
+            logger.warning("Unable to add discovered chat (%s)", type(exc).__name__)
+            return {"status": "error", "message": "Не вдалося приєднатися або додати чат. Перевірте доступ."}

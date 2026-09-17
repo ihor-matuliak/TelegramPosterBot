@@ -30,6 +30,10 @@ class Config:
 
     # Google Gemini AI
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    DISCOVERY_RPC_MIN_SECONDS: float = max(3.0, float(os.getenv("DISCOVERY_RPC_MIN_SECONDS", "4")))
+    DISCOVERY_RPC_MAX_SECONDS: float = max(DISCOVERY_RPC_MIN_SECONDS, float(os.getenv("DISCOVERY_RPC_MAX_SECONDS", "8")))
+    DISCOVERY_CYCLE_SECONDS: int = max(60, int(os.getenv("DISCOVERY_CYCLE_SECONDS", "300")))
 
     # Supabase Cloud Database
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")

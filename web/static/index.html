@@ -118,99 +118,54 @@
 
             <!-- TAB: CONTEXTUAL AI DISCOVERY & QUALIFICATION -->
             <div id="tab-finder" class="tab-pane">
-                <div class="tg-card">
-                    <div class="card-header">
-                        <div class="card-title">🧠 Розумний AI Discovery & Кваліфікація чатів Telegram</div>
-                        <span class="badge" style="background: rgba(36, 129, 204, 0.15); color: var(--accent-blue-hover); border: 1px solid var(--accent-blue);">
-                            ⚡ Gemini 3.5 Flash Lite + Multi-Model Fallback
-                        </span>
-                    </div>
-
-                    <p style="color: var(--text-secondary); font-size: 13.5px; margin-bottom: 16px; line-height: 1.5;">
-                        Опишіть людською мовою, які чати ви шукаєте (наприклад: <i>«OnlyFans Fansly advertising groups»</i>, <i>«меблі барахолка київ»</i>, <i>«арбітраж трафіку чати»</i>). AI самостійно визначить інтент, розгорне підзапити, знайде відкриті групи через Telegram API, відсіє вже додані та розрахує точну семантичну відповідність.
-                    </p>
-
-                    <!-- Search Box -->
-                    <form id="finderSearchForm" style="display: flex; gap: 12px; margin-bottom: 12px;">
-                        <input type="text" id="finderQueryInput" class="tg-input" placeholder="Введіть пошуковий інтент (наприклад: OnlyFans Fansly promo groups, меблі оголошення...)" required style="flex: 1;">
-                        
-                        <select id="finderDefaultInterval" class="tg-select" style="width: 190px;">
-                            <option value="60">Інтервал: 1 год</option>
-                            <option value="120">Інтервал: 2 год</option>
-                            <option value="1440" selected>Інтервал: 1 доба</option>
-                            <option value="4320">Інтервал: 3 дні</option>
-                        </select>
-
-                        <button type="submit" id="finderSubmitBtn" class="tg-btn tg-btn-primary" style="white-space: nowrap; padding: 0 20px;">
-                            🧠 Знайти та кваліфікувати
-                        </button>
+                <div class="tg-card discovery-panel">
+                    <div class="card-header"><h2 class="card-title">Пошук професійних груп</h2><span class="badge">Reddit · OFM · Трафік</span></div>
+                    <p class="discovery-intro">Знаходьте агенції, чатерів і фахівців з adult-трафіку. Перевіряємо доступний контент груп і показуємо нові знахідки без повторів.</p>
+                    <form id="finderSearchForm" class="discovery-search-form">
+                        <label class="discovery-query">Пошукові слова
+                            <textarea id="finderQueryInput" class="tg-input" rows="2" maxlength="1500" required>OnlyFans, OFM, Fansly, Reddit, adult traffic, брачка, Fanvue, ManyVids, Webcam, loyalfans, CamSoda</textarea>
+                        </label>
+                        <label>Від учасників<input id="finderMinMembers" class="tg-input" type="number" min="0" max="100000000" step="1" value="0"></label>
+                        <div class="discovery-controls">
+                            <button type="submit" id="finderSubmitBtn" class="tg-btn tg-btn-primary">Почати пошук</button>
+                            <button type="button" id="finderStopBtn" class="tg-btn tg-btn-secondary" disabled>Стоп</button>
+                        </div>
                     </form>
-
-                    <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 8px;">
-                        <span style="font-size: 12.5px; color: var(--text-secondary);">Варіант поста для знайдених груп:</span>
-                        <select id="finderDefaultPost" class="tg-select" style="max-width: 280px; padding: 6px 12px; font-size: 13px;">
-                            <option value="default">⭐️ За замовчуванням (Основне)</option>
-                        </select>
+                    <p class="discovery-help">Пошук триває на сервері до зупинки. Між циклами й під час обмежень Telegram можливі паузи. AI доповнює пошукові слова.</p>
+                    <div class="discovery-status" role="status" aria-live="polite">
+                        <p id="discoveryStatusText">Готово до пошуку</p>
+                        <p id="discoveryCurrentQuery"></p><p id="discoveryStats"></p>
                     </div>
-
-                    <!-- Quick Suggestions -->
-                    <div class="pills-container">
-                        <span style="font-size: 12px; color: var(--text-muted); align-self: center;">Популярні ніші:</span>
-                        <span class="search-pill" onclick="setFinderQuery('OnlyFans Fansly advertising promo groups')">🔞 OnlyFans & Fansly Promo</span>
-                        <span class="search-pill" onclick="setFinderQuery('меблі барахолка оголошення україна')">🛋️ Меблі & Інтер'єр</span>
-                        <span class="search-pill" onclick="setFinderQuery('квіти подарунки дошка оголошень')">💐 Квіти & Подарунки</span>
-                        <span class="search-pill" onclick="setFinderQuery('арбітраж трафіку реклама маркетинг')">📈 Трафік & Маркетинг</span>
-                        <span class="search-pill" onclick="setFinderQuery('барахолка київ продаж речей')">📦 Барахолка Київ</span>
-                        <span class="search-pill" onclick="setFinderQuery('послуги та робота україна')">🛠️ Послуги & Оголошення</span>
+                    <div class="discovery-toolbar">
+                        <button type="button" id="discoverySessionBtn" class="tg-btn tg-btn-secondary">Поточний пошук</button>
+                        <button type="button" id="discoveryHistoryBtn" class="tg-btn tg-btn-secondary">Історія всіх знахідок</button>
                     </div>
-
-                    <!-- Progress Stepper (Hidden by default) -->
-                    <div id="discoveryStepper" style="display: none; margin-top: 20px; padding: 16px; background: rgba(23, 33, 43, 0.7); border: 1px solid var(--border-color); border-radius: var(--radius-md);">
-                        <div style="display: flex; justify-content: space-between; font-size: 12.5px; color: var(--text-secondary);">
-                            <div id="step-1" class="discovery-step active">🧠 1. AI аналіз інтенту</div>
-                            <div id="step-2" class="discovery-step">📡 2. Пошук у Telegram</div>
-                            <div id="step-3" class="discovery-step">📐 3. Векторні Embeddings</div>
-                            <div id="step-4" class="discovery-step">⭐ 4. AI-ранжування</div>
+                    <details class="discovery-post-settings"><summary>Налаштування додавання в розсилку</summary>
+                        <div class="discovery-toolbar">
+                            <label>Оголошення<select id="finderDefaultPost" class="tg-select"><option value="default">За замовчуванням</option></select></label>
+                            <label>Інтервал<select id="finderDefaultInterval" class="tg-select"><option value="60">1 година</option><option value="120">2 години</option><option value="1440" selected>1 доба</option><option value="4320">3 доби</option></select></label>
                         </div>
-                        <div class="discovery-progress-bar" style="margin-top: 10px; height: 4px; background: var(--bg-tertiary); border-radius: 2px; overflow: hidden;">
-                            <div id="discoveryProgressFill" style="width: 25%; height: 100%; background: linear-gradient(90deg, var(--accent-blue), #a855f7); transition: width 0.4s ease;"></div>
-                        </div>
-                        <div id="discoveryStatusText" style="margin-top: 8px; font-size: 12px; color: var(--accent-blue-hover); text-align: center;">
-                            AI аналізує запит та генерує семантичні підзапити...
-                        </div>
-                    </div>
+                    </details>
                 </div>
-
-                <!-- Search Results Card -->
-                <div id="finderResultsCard" class="tg-card" style="display: none;">
-                    <div class="card-header" style="flex-wrap: wrap; gap: 12px;">
-                        <div>
-                            <div class="card-title" id="finderResultsCountTitle">Кваліфіковані результати (0)</div>
-                            <div id="finderExclusionNote" style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">
-                                🛡️ Усі вже додані до вашої розсилки чати автоматично виключені.
-                            </div>
-                        </div>
-
-                        <!-- Filters & Sorting Bar -->
-                        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                            <div style="display: flex; gap: 6px;">
-                                <button type="button" class="filter-chip active" data-filter="all" onclick="setDiscoveryFilter('all')">Всі</button>
-                                <button type="button" class="filter-chip" data-filter="group" onclick="setDiscoveryFilter('group')">👥 Групи (можна писати)</button>
-                                <button type="button" class="filter-chip" data-filter="channel" onclick="setDiscoveryFilter('channel')">📢 Канали</button>
-                            </div>
-
-                            <button type="button" id="batchAddFoundBtn" class="tg-btn tg-btn-purple tg-btn-sm" style="display: none;">
-                                📥 Додати всі вибрані (<span id="selectedCountSpan">0</span>)
-                            </button>
-                        </div>
+                <div id="finderResultsCard" class="tg-card discovery-panel" hidden>
+                    <div class="card-header discovery-results-header">
+                        <h2 class="card-title" id="finderResultsCountTitle">Результати пошуку</h2>
+                        <label>Показати<select id="discoveryDecision" class="tg-select">
+                            <option value="accepted">Цільові групи</option><option value="unverified">Не перевірені</option>
+                            <option value="rejected">Відхилені</option><option value="below_minimum">Нижче порогу учасників</option><option value="all">Усі знахідки</option>
+                        </select></label>
+                        <button type="button" id="batchAddFoundBtn" class="tg-btn tg-btn-primary" hidden>Додати вибрані</button>
                     </div>
-
-                    <!-- Cards Container -->
-                    <div id="discoveryCardsGrid" class="discovery-grid">
-                        <!-- Rendered by app.js -->
+                    <p class="discovery-help">Релевантність аудиторії не підтверджує дозвіл на рекламу. Правила групи показані окремо.</p>
+                    <div id="discoveryCardsGrid" class="discovery-grid"></div>
+                    <div class="discovery-pagination">
+                        <button type="button" id="discoveryPrev" class="tg-btn tg-btn-secondary" disabled>Назад</button>
+                        <span id="discoveryPageLabel"></span>
+                        <button type="button" id="discoveryNext" class="tg-btn tg-btn-secondary" disabled>Далі</button>
                     </div>
                 </div>
             </div>
+
 
             <!-- TAB 2: POST EDITOR & PREVIEW (MULTI-TEMPLATES & PREMIUM EMOJIS) -->
             <div id="tab-post" class="tab-pane">
@@ -549,6 +504,7 @@
         </div>
     </div>
 
+    <script src="/static/discovery.js"></script>
     <script src="/static/app.js"></script>
 </body>
 </html>
