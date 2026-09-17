@@ -1,7 +1,8 @@
 import asyncio
 import random
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from enum import Enum
 from telethon.errors.rpcerrorlist import (
     FloodWaitError,
     SlowModeWaitError,
@@ -9,7 +10,9 @@ from telethon.errors.rpcerrorlist import (
     UserBannedInChannelError,
     ChannelPrivateError,
     ChatAdminRequiredError,
-    PeerIdInvalidError
+    PeerIdInvalidError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
 )
 from telethon.errors import RPCError
 from core.client import client, simulate_typing
@@ -19,12 +22,57 @@ from database.client import db
 logger = logging.getLogger("PosterEngine")
 
 
+class PostOutcome(Enum):
+    SENT = "sent"
+    CHAT_UNAVAILABLE = "chat_unavailable"
+    DEFERRED = "deferred"
+    SYSTEM_ERROR = "system_error"
+
+
 class PosterWorker:
     def __init__(self):
         self._is_active = False
         self._task: asyncio.Task | None = None
         self._consecutive_errors = 0
         self._batch_post_count = 0
+        self._wait_reason: str | None = None
+        self._wait_until: datetime | None = None
+        self._circuit_reason: str | None = None
+
+    def reset_errors(self) -> None:
+        self._consecutive_errors = 0
+        self._circuit_reason = None
+
+    def get_status(self, settings: dict, authorized: bool, hourly: int, daily: int) -> dict:
+        """Report the local worker's actual blockers separately from the master switch."""
+        if not settings.get("is_running", False):
+            event = db.get_poster_control_event()
+            reason = (event or {}).get("details") if (event or {}).get("status") == "circuit_breaker" else None
+            return {"state": "paused", "reason": reason or "Розсилку призупинено", "until": None}
+        if self._circuit_reason:
+            return {"state": "paused", "reason": self._circuit_reason, "until": None}
+        if not self._is_active or not self._task or self._task.done():
+            return {"state": "stopped", "reason": "Планувальник не запущений", "until": None}
+        if not authorized:
+            return {"state": "unauthorized", "reason": "Немає підключення або авторизації Telegram", "until": None}
+        if self._wait_until and self._wait_until > datetime.now(timezone.utc):
+            return {"state": "waiting", "reason": self._wait_reason, "until": self._wait_until.isoformat()}
+        if self._is_night_time(settings):
+            return {"state": "night", "reason": "Нічна пауза", "until": None}
+        if hourly >= settings.get("max_posts_per_hour", 15):
+            return {"state": "hourly_limit", "reason": "Досягнуто погодинного ліміту", "until": None}
+        if daily >= settings.get("max_posts_per_day", 150):
+            return {"state": "daily_limit", "reason": "Досягнуто добового ліміту", "until": None}
+        return {"state": "running", "reason": None, "until": None}
+
+    async def _wait(self, seconds: int, reason: str) -> None:
+        self._wait_reason = reason
+        self._wait_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        try:
+            await asyncio.sleep(seconds)
+        finally:
+            self._wait_reason = None
+            self._wait_until = None
 
     async def start(self):
         """Start the background posting loop."""
@@ -68,13 +116,17 @@ class PosterWorker:
                 # 1. Check global master switch
                 settings = db.get_settings()
                 if not settings.get("is_running", False):
+                    self.reset_errors()
+                    await asyncio.sleep(5)
+                    continue
+                if self._circuit_reason:
                     await asyncio.sleep(5)
                     continue
 
                 # 2. Night sleep mode protection
                 if self._is_night_time(settings):
                     logger.info("🌙 Night sleep mode active. Sleeping 15 minutes to prevent bot-like night activity...")
-                    await asyncio.sleep(900)
+                    await self._wait(900, "Нічна пауза")
                     continue
 
                 # 3. Check if user is connected and authorized
@@ -88,14 +140,14 @@ class PosterWorker:
                 cur_hourly = db.get_hourly_post_count()
                 if cur_hourly >= max_hourly:
                     logger.warning(f"🛡️ Safety throttle: Hourly limit reached ({cur_hourly}/{max_hourly} posts). Resting 5 min...")
-                    await asyncio.sleep(300)
+                    await self._wait(300, "Досягнуто погодинного ліміту")
                     continue
 
                 max_daily = settings.get("max_posts_per_day", 150)
                 cur_daily = db.get_daily_post_count()
                 if cur_daily >= max_daily:
                     logger.warning(f"🛡️ Safety throttle: Daily limit reached ({cur_daily}/{max_daily} posts). Resting 30 min...")
-                    await asyncio.sleep(1800)
+                    await self._wait(1800, "Досягнуто добового ліміту")
                     continue
 
                 # 5. Batch Rest Cooldown (Humanization)
@@ -105,7 +157,7 @@ class PosterWorker:
                     logger.info(f"☕ Batch of {self._batch_post_count} posts completed. Taking a human rest pause for {batch_rest_min} minutes...")
                     db.add_log("SYSTEM", "security_pause", f"Захисна пауза після {self._batch_post_count} постів на {batch_rest_min} хв")
                     self._batch_post_count = 0
-                    await asyncio.sleep(batch_rest_min * 60)
+                    await self._wait(batch_rest_min * 60, "Захисна пауза між серіями публікацій")
                     continue
 
                 # 6. Fetch chats that are due for posting
@@ -129,6 +181,12 @@ class PosterWorker:
                     # Check hourly cap mid-batch
                     if db.get_hourly_post_count() >= fresh_settings.get("max_posts_per_hour", 15):
                         logger.warning("Hourly limit reached mid-batch. Pausing...")
+                        break
+                    if db.get_daily_post_count() >= fresh_settings.get("max_posts_per_day", 150):
+                        break
+                    if self._batch_post_count >= fresh_settings.get("batch_size", 6):
+                        break
+                    if self._is_night_time(fresh_settings):
                         break
 
                     # Determine which post variant to use for this specific chat
@@ -154,18 +212,21 @@ class PosterWorker:
                         final_text = SpintaxEngine.inject_anti_fingerprint(final_text, True)
 
                     # Post with full error handling, native custom emojis, and typing simulation
-                    success = await self._post_to_chat(chat, final_text, fresh_settings, target_post)
+                    outcome = await self._post_to_chat(chat, final_text, fresh_settings, target_post)
                     
-                    if success:
+                    if outcome is PostOutcome.SENT:
                         self._batch_post_count += 1
                         self._consecutive_errors = 0
-                    else:
+                    elif outcome is PostOutcome.SYSTEM_ERROR:
                         self._consecutive_errors += 1
                         # Circuit breaker
                         if fresh_settings.get("auto_circuit_breaker", True) and self._consecutive_errors >= 3:
                             logger.error("🚨 CIRCUIT BREAKER TRIGGERED: 3 consecutive errors! Auto-pausing poster for safety.")
-                            db.toggle_poster(False)
-                            db.add_log("SECURITY", "circuit_breaker", "Автоматична аварійна пауза: виявлено 3 помилки поспіль для захисту акаунту.")
+                            reason = "Автоматична аварійна пауза: 3 системні помилки поспіль. Перевірте журнал перед відновленням."
+                            self._consecutive_errors = 0
+                            # Keep this process paused even if persistence is unavailable.
+                            self._circuit_reason = reason
+                            db.toggle_poster(False, reason=reason)
                             break
 
                     # Random human-like delay between consecutive chats
@@ -174,15 +235,15 @@ class PosterWorker:
                     delay = random.randint(min(min_delay, max_delay), max(min_delay, max_delay))
                     
                     logger.info(f"Waiting {delay}s before next chat to emulate human behavior...")
-                    await asyncio.sleep(delay)
+                    await self._wait(delay, "Інтервал між публікаціями")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Unexpected error in Poster loop: {e}", exc_info=True)
-                await asyncio.sleep(10)
+                await self._wait(10, "Помилка планувальника — повторна перевірка")
 
-    async def _post_to_chat(self, chat: dict, ad_text: str, settings: dict, active_post: dict | None = None) -> bool:
+    async def _post_to_chat(self, chat: dict, ad_text: str, settings: dict, active_post: dict | None = None) -> PostOutcome:
         """Post the message to a specific chat with comprehensive error handling & typing simulation."""
         chat_id = chat["id"]
         chat_peer = chat["chat_peer"]
@@ -193,7 +254,12 @@ class PosterWorker:
 
         try:
             # 1. Resolve peer
-            peer = await client.get_input_entity(chat_peer)
+            try:
+                peer = await client.get_input_entity(chat_peer)
+            except ValueError:
+                db.update_chat(chat_id, {"status": "error", "is_active": False, "last_error": "Не вдалося знайти чат за посиланням"})
+                db.add_log(chat_peer, "failed", "Не вдалося знайти чат за посиланням")
+                return PostOutcome.CHAT_UNAVAILABLE
 
             # 2. Simulate human typing action if enabled
             if settings.get("enable_typing_simulation", True):
@@ -207,19 +273,19 @@ class PosterWorker:
 
             if source_msg_id:
                 # Fetch original Telegram message to keep 100% native animated emojis, media, and formatting
+                src_msg = None
                 try:
                     src_msg = await client.get_messages(source_chat, ids=int(source_msg_id))
-                    if src_msg and (src_msg.message or src_msg.text):
-                        logger.info(f"✨ Sending native Telegram message #{source_msg_id} with {len(src_msg.entities or [])} entities & Premium Emojis")
-                        await client.send_message(
-                            peer,
-                            message=src_msg.message or src_msg.text,
-                            formatting_entities=src_msg.entities,
-                            file=src_msg.media
-                        )
-                        sent = True
-                except Exception as src_err:
+                except (ValueError, PeerIdInvalidError, ChannelPrivateError, ChatAdminRequiredError) as src_err:
                     logger.warning(f"Could not use raw source message {source_msg_id}, falling back to text: {src_err}")
+                if src_msg and (src_msg.message or src_msg.text):
+                    await client.send_message(
+                        peer,
+                        message=src_msg.message or src_msg.text,
+                        formatting_entities=src_msg.entities,
+                        file=src_msg.media
+                    )
+                    sent = True
 
             if not sent:
                 # Send with HTML formatting (supports Telegram Premium tags <tg-emoji> and standard formatting)
@@ -231,43 +297,43 @@ class PosterWorker:
             db.update_chat_post_success(chat_id, interval, jitter_sec)
             db.add_log(chat_peer, "success", f"Успішно опубліковано. Наступний через {interval}хв + {jitter_sec}с")
             logger.info(f"✅ Successfully posted to '{chat_peer}'.")
-            return True
+            return PostOutcome.SENT
 
         except SlowModeWaitError as e:
             wait_seconds = getattr(e, "seconds", 60)
             logger.warning(f"⏳ SlowMode in '{chat_peer}': must wait {wait_seconds}s.")
             db.update_chat_delay(chat_id, wait_seconds + 5, "slowmode_wait", f"Повільний режим: чекати {wait_seconds}с")
             db.add_log(chat_peer, "slowmode_wait", f"Slowmode {wait_seconds}s")
-            return False
+            return PostOutcome.DEFERRED
 
         except FloodWaitError as e:
             wait_seconds = getattr(e, "seconds", 60)
             logger.error(f"🚨 Telegram FloodWait: {wait_seconds}s required. Sleeping...")
             db.update_chat_delay(chat_id, wait_seconds + 15, "flood_wait", f"FloodWait: {wait_seconds}с")
             db.add_log(chat_peer, "flood_wait", f"FloodWait {wait_seconds}s")
-            await asyncio.sleep(wait_seconds + 2)
-            return False
+            await self._wait(wait_seconds + 2, "Обмеження Telegram (FloodWait)")
+            return PostOutcome.DEFERRED
 
         except (ChatWriteForbiddenError, UserBannedInChannelError) as e:
             err_msg = "Заборонено писати в чат або бан"
             logger.warning(f"🚫 Cannot write to '{chat_peer}': {e}")
             db.update_chat(chat_id, {"status": "restricted", "is_active": False, "last_error": err_msg})
             db.add_log(chat_peer, "failed", f"Обмеження: {err_msg}")
-            return False
+            return PostOutcome.CHAT_UNAVAILABLE
 
         except (ChannelPrivateError, ChatAdminRequiredError) as e:
             err_msg = "Чат приватний або вимагає прав адміна"
             logger.warning(f"🔒 Access issue with '{chat_peer}': {e}")
             db.update_chat(chat_id, {"status": "error", "is_active": False, "last_error": err_msg})
             db.add_log(chat_peer, "failed", f"Доступ: {err_msg}")
-            return False
+            return PostOutcome.CHAT_UNAVAILABLE
 
-        except PeerIdInvalidError:
+        except (PeerIdInvalidError, UsernameInvalidError, UsernameNotOccupiedError):
             err_msg = "Невірний username або посилання"
             logger.error(f"❌ Invalid peer: '{chat_peer}'")
             db.update_chat(chat_id, {"status": "error", "is_active": False, "last_error": err_msg})
             db.add_log(chat_peer, "failed", err_msg)
-            return False
+            return PostOutcome.CHAT_UNAVAILABLE
 
         except RPCError as e:
             err_text = str(e)
@@ -275,22 +341,24 @@ class PosterWorker:
                 wait_sec = getattr(e, "seconds", 60)
                 db.update_chat_delay(chat_id, wait_sec + 5, "slowmode_wait", f"Slowmode: {wait_sec}с")
                 db.add_log(chat_peer, "slowmode_wait", f"Slowmode {wait_sec}s")
+                return PostOutcome.DEFERRED
             elif "FLOOD_WAIT" in err_text:
                 wait_sec = getattr(e, "seconds", 60)
                 db.update_chat_delay(chat_id, wait_sec + 15, "flood_wait", f"FloodWait: {wait_sec}с")
                 db.add_log(chat_peer, "flood_wait", f"FloodWait {wait_sec}s")
-                await asyncio.sleep(wait_sec + 2)
+                await self._wait(wait_sec + 2, "Обмеження Telegram (FloodWait)")
+                return PostOutcome.DEFERRED
             else:
                 logger.error(f"❌ RPCError on '{chat_peer}': {e}")
                 db.update_chat_delay(chat_id, 900, "error", err_text)
                 db.add_log(chat_peer, "failed", f"RPC Помилка: {err_text}")
-            return False
+            return PostOutcome.SYSTEM_ERROR
 
         except Exception as e:
             logger.error(f"❌ Failed to post to '{chat_peer}': {e}")
             db.update_chat_delay(chat_id, 900, "error", str(e))
             db.add_log(chat_peer, "failed", f"Помилка: {str(e)}")
-            return False
+            return PostOutcome.SYSTEM_ERROR
 
 
 poster_worker = PosterWorker()

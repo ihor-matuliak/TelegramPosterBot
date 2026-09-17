@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, SlowModeWaitError
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
     SendMessageTypingAction
@@ -26,7 +27,8 @@ client = TelegramClient(
     api_hash=_safe_api_hash,
     device_model="Desktop PC",
     system_version="Windows 11",
-    app_version="5.4.1"
+    app_version="5.4.1",
+    flood_sleep_threshold=0
 )
 
 
@@ -97,6 +99,7 @@ async def simulate_typing(peer, duration_seconds: int = 4):
     try:
         await client(SetTypingRequest(peer=peer, action=SendMessageTypingAction()))
         await asyncio.sleep(duration_seconds)
+    except (FloodWaitError, SlowModeWaitError):
+        raise
     except Exception:
         pass
-

@@ -11,6 +11,8 @@ from aiogram.fsm.state import State, StatesGroup
 
 from config import config
 from database.client import db
+from core.poster import poster_worker
+from html import escape
 from bot.keyboards import (
     get_main_menu_keyboard,
     get_posts_list_keyboard,
@@ -54,10 +56,16 @@ def get_status_text() -> str:
     error_chats = sum(1 for c in chats if c.get("status") in ["error", "restricted"])
 
     status_emoji = "🟢 АКТИВНИЙ" if is_running else "⏸️ НА ПАУЗІ"
+    pause_details = ""
+    if not is_running:
+        event = db.get_poster_control_event()
+        if event and event.get("status") == "circuit_breaker":
+            pause_details = f"• Причина: {escape(event.get('details') or 'Аварійна пауза')}\n"
 
     text = (
         f"🚀 <b>Панель керування автопостером</b>\n\n"
         f"• Статус розсилки: <b>{status_emoji}</b>\n"
+        f"{pause_details}"
         f"• Всього чатів: <b>{len(chats)}</b> (активних: {active_chats})\n"
         f"• Варіантів постів: <b>{len(posts)}</b>\n"
         f"• Помилок / обмежень: <b>{error_chats}</b>\n"
@@ -115,7 +123,10 @@ async def cb_pause(call: CallbackQuery):
         await call.answer("🚫 Доступ заборонено.", show_alert=True)
         return
 
-    db.toggle_poster(False)
+    if not db.toggle_poster(False):
+        await call.answer("Не вдалося зберегти паузу. Спробуйте ще раз.", show_alert=True)
+        return
+    poster_worker.reset_errors()
     await call.message.edit_text(
         get_status_text(),
         reply_markup=get_main_menu_keyboard(False),
@@ -130,7 +141,10 @@ async def cb_resume(call: CallbackQuery):
         await call.answer("🚫 Доступ заборонено.", show_alert=True)
         return
 
-    db.toggle_poster(True)
+    if not db.toggle_poster(True):
+        await call.answer("Не вдалося запустити розсилку. Спробуйте ще раз.", show_alert=True)
+        return
+    poster_worker.reset_errors()
     await call.message.edit_text(
         get_status_text(),
         reply_markup=get_main_menu_keyboard(True),
@@ -141,6 +155,7 @@ async def cb_resume(call: CallbackQuery):
 
 @router.callback_query(F.data == "btn_status")
 async def cb_status_details(call: CallbackQuery):
+    settings = db.get_settings()
     chats = db.get_all_chats()
     posts = {p["id"]: p.get("title", "Пост") for p in db.get_all_posts()}
     now = datetime.now(timezone.utc)
@@ -166,11 +181,15 @@ async def cb_status_details(call: CallbackQuery):
             try:
                 next_dt = datetime.fromisoformat(next_post)
                 diff_m = int((next_dt - now).total_seconds() / 60)
-                diff_str = f"через {diff_m}хв" if diff_m > 0 else "готовий зараз ⚡"
+                diff_str = f"через {diff_m}хв" if diff_m > 0 else "у черзі на відправку"
             except Exception:
                 diff_str = "—"
         else:
             diff_str = "—"
+        if not chat.get("is_active"):
+            diff_str = "чат вимкнено"
+        elif not settings.get("is_running", False):
+            diff_str = "розсилку призупинено"
 
         lines.append(f"• <code>{peer}</code> ({interval}хв): {diff_str}\n  └ <i>Шаблон: {post_title}</i> [{status}]")
 

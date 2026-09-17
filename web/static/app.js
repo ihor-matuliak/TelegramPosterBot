@@ -4,6 +4,8 @@
 
 let activeTab = 'chats';
 let isMasterRunning = false;
+let posterStatus = { state: 'unknown', reason: 'Стан розсилки уточнюється' };
+let cachedChats = [];
 let postsList = [];
 let currentPostId = null;
 let currentSourceMsgId = null;
@@ -113,6 +115,7 @@ function initEventListeners() {
 async function fetchStatus() {
     try {
         const res = await fetch('/api/status');
+        if (!res.ok) throw new Error('Не вдалося отримати стан розсилки');
         const data = await res.json();
 
         // Update User & Premium info
@@ -129,6 +132,7 @@ async function fetchStatus() {
 
         // Update Master Toggle
         isMasterRunning = data.is_running;
+        posterStatus = data.poster || { state: isMasterRunning ? 'unknown' : 'paused', reason: isMasterRunning ? 'Стан планувальника невідомий' : 'Розсилку призупинено' };
         const btn = document.getElementById('masterToggleBtn');
         const text = document.getElementById('masterToggleText');
         if (isMasterRunning) {
@@ -138,6 +142,11 @@ async function fetchStatus() {
             btn.className = 'master-toggle-btn paused';
             text.textContent = 'Розсилка на паузі (Вимкнено)';
         }
+        if (posterStatus.reason) text.textContent = posterStatus.reason;
+        btn.title = posterStatus.until
+            ? `Наступна перевірка: ${new Date(posterStatus.until).toLocaleTimeString()}`
+            : (posterStatus.reason || 'Натисніть, щоб призупинити розсилку');
+        renderChatsTable(cachedChats);
 
         // Update Stat Badges
         document.getElementById('statTotalChats').textContent = data.total_chats;
@@ -173,6 +182,9 @@ async function fetchStatus() {
             document.getElementById('circuitBreakerInput').checked = data.settings.auto_circuit_breaker !== false;
         }
     } catch (err) {
+        posterStatus = { state: 'unknown', reason: 'Немає зв’язку з сервером' };
+        document.getElementById('masterToggleText').textContent = posterStatus.reason;
+        renderChatsTable(cachedChats);
         console.error('Error fetching status:', err);
     }
 }
@@ -181,10 +193,12 @@ async function toggleMasterPoster() {
     try {
         const res = await fetch('/api/settings/toggle', { method: 'POST' });
         const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Не вдалося змінити стан розсилки');
         isMasterRunning = data.is_running;
-        fetchStatus();
+        await fetchStatus();
     } catch (err) {
         console.error('Error toggling poster:', err);
+        alert(err.message);
     }
 }
 
@@ -193,7 +207,9 @@ async function toggleMasterPoster() {
 async function fetchChats() {
     try {
         const res = await fetch('/api/chats');
+        if (!res.ok) throw new Error('Не вдалося отримати чати');
         const chats = await res.json();
+        cachedChats = chats;
         renderChatsTable(chats);
     } catch (err) {
         console.error('Error fetching chats:', err);
@@ -212,11 +228,11 @@ function renderChatsTable(chats) {
     tbody.innerHTML = chats.map(chat => {
         let statusBadge = '';
         if (!chat.is_active) {
-            statusBadge = `<span class="badge badge-paused">⏸️ Вимкнено</span>`;
+            statusBadge = `<span class="badge badge-paused" title="${escapeHtml(chat.last_error || '')}">⏸️ Вимкнено${chat.last_error ? ': ' + escapeHtml(chat.last_error) : ''}</span>`;
         } else if (chat.status === 'slowmode_wait') {
             statusBadge = `<span class="badge badge-slowmode">⏳ SlowMode</span>`;
         } else if (chat.status === 'error' || chat.status === 'restricted') {
-            statusBadge = `<span class="badge badge-error" title="${chat.last_error || ''}">🚫 ${chat.last_error || 'Помилка'}</span>`;
+            statusBadge = `<span class="badge badge-error" title="${escapeHtml(chat.last_error || '')}">🚫 ${escapeHtml(chat.last_error || 'Помилка')}</span>`;
         } else {
             statusBadge = `<span class="badge badge-active">🟢 Активний</span>`;
         }
@@ -229,9 +245,11 @@ function renderChatsTable(chats) {
         let nextPostLabel = '—';
         if (chat.next_post_at && chat.is_active) {
             const nextDate = new Date(chat.next_post_at);
-            const diffMinutes = Math.round((nextDate - now) / 60000);
-            if (diffMinutes <= 0) {
-                nextPostLabel = `<span style="color: var(--accent-green); font-weight: 600;">Готовий до відправки</span>`;
+            const diffMinutes = Math.ceil((nextDate - now) / 60000);
+            if (posterStatus.state !== 'running') {
+                nextPostLabel = `<span class="badge badge-paused">${escapeHtml(posterStatus.reason || 'Очікування розсилки')}</span>`;
+            } else if (nextDate <= now) {
+                nextPostLabel = `<span style="color: var(--accent-green); font-weight: 600;">У черзі на відправку</span>`;
             } else {
                 nextPostLabel = `Через ${diffMinutes} хв (${nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`;
             }
@@ -766,339 +784,19 @@ async function handleSaveSettings(e) {
     };
 
     try {
-        await fetch('/api/settings', {
+        const response = await fetch('/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || 'Не вдалося зберегти налаштування');
+        }
         alert('🛡️ Всі налаштування безпеки та анти-флуду збережено!');
         fetchStatus();
     } catch (err) {
         alert('Помилка оновлення налаштувань: ' + err);
-    }
-}
-
-// ==================== CONTEXTUAL AI DISCOVERY & QUALIFICATION ====================
-
-let activeDiscoverySessionId = null;
-let discoveryPollingInterval = null;
-let currentDiscoveryCandidates = [];
-let activeDiscoveryFilter = 'all';
-let selectedDiscoveryPeers = new Set();
-
-function setFinderQuery(q) {
-    document.getElementById('finderQueryInput').value = q;
-    handleFinderSearch(new Event('submit'));
-}
-
-async function handleFinderSearch(e) {
-    if (e && e.preventDefault) e.preventDefault();
-    const query = document.getElementById('finderQueryInput').value.trim();
-    if (!query) return;
-
-    const btn = document.getElementById('finderSubmitBtn');
-    const stepper = document.getElementById('discoveryStepper');
-    const resultsCard = document.getElementById('finderResultsCard');
-    const grid = document.getElementById('discoveryCardsGrid');
-
-    btn.disabled = true;
-    btn.innerHTML = '⏳ <span>AI аналізує запит...</span>';
-    stepper.style.display = 'block';
-    resultsCard.style.display = 'block';
-    grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); padding: 40px;">⏳ Пошук груп у Telegram та аналіз семантики через Gemini 3.5 Flash Lite...</div>';
-
-    updateDiscoveryProgress(1, 'AI аналізує запит та генерує семантичні підзапити...');
-
-    if (discoveryPollingInterval) clearInterval(discoveryPollingInterval);
-    selectedDiscoveryPeers.clear();
-    updateSelectedCountUI();
-
-    try {
-        const res = await fetch('/api/discovery/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: query, limit: 30 })
-        });
-        const data = await res.json();
-        activeDiscoverySessionId = data.session_id;
-
-        // Start Polling search session progress
-        discoveryPollingInterval = setInterval(() => pollDiscoverySession(activeDiscoverySessionId), 2000);
-    } catch (err) {
-        btn.disabled = false;
-        btn.innerHTML = '🧠 Знайти та кваліфікувати';
-        grid.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; color: var(--accent-red); padding: 30px;">Помилка запуску пошуку: ${err}</div>`;
-    }
-}
-
-async function pollDiscoverySession(sessionId) {
-    try {
-        const res = await fetch(`/api/discovery/results/${sessionId}`);
-        const data = await res.json();
-
-        if (data.search) {
-            const status = data.search.status;
-            if (status === 'searching') {
-                updateDiscoveryProgress(2, `Пошук каналів та повідомлень у Telegram API... (знайдено: ${data.search.total_candidates || 0})`);
-            } else if (status === 'scoring') {
-                updateDiscoveryProgress(3, `Розрахунок семантичної подібності та AI-кваліфікація кандидатів...`);
-            } else if (status === 'completed' || status === 'failed') {
-                clearInterval(discoveryPollingInterval);
-                const btn = document.getElementById('finderSubmitBtn');
-                btn.disabled = false;
-                btn.innerHTML = '🧠 Знайти та кваліфікувати';
-
-                if (status === 'completed') {
-                    updateDiscoveryProgress(4, `Готово! Знайдено ${data.results.length} кваліфікованих цільових груп.`);
-                    currentDiscoveryCandidates = data.results || [];
-                    renderDiscoveryCards(currentDiscoveryCandidates);
-                } else {
-                    document.getElementById('discoveryStatusText').textContent = '⚠️ ' + (data.search.error_message || 'Помилка пошуку');
-                }
-            }
-        }
-    } catch (err) {
-        console.error('Polling error:', err);
-    }
-}
-
-function updateDiscoveryProgress(step, text) {
-    const fill = document.getElementById('discoveryProgressFill');
-    const statusText = document.getElementById('discoveryStatusText');
-    const widthPct = step === 1 ? '25%' : step === 2 ? '50%' : step === 3 ? '75%' : '100%';
-    if (fill) fill.style.width = widthPct;
-    if (statusText) statusText.textContent = text;
-
-    for (let i = 1; i <= 4; i++) {
-        const el = document.getElementById(`step-${i}`);
-        if (el) {
-            el.classList.toggle('active', i <= step);
-        }
-    }
-}
-
-function setDiscoveryFilter(filterType) {
-    activeDiscoveryFilter = filterType;
-    document.querySelectorAll('.filter-chip').forEach(btn => {
-        btn.classList.toggle('active', btn.getAttribute('data-filter') === filterType);
-    });
-    renderDiscoveryCards(currentDiscoveryCandidates);
-}
-
-function renderDiscoveryCards(results) {
-    const grid = document.getElementById('discoveryCardsGrid');
-    const title = document.getElementById('finderResultsCountTitle');
-
-    let filtered = results;
-    if (activeDiscoveryFilter === 'group') {
-        filtered = results.filter(r => r.chat_type === 'group' || r.chat_type === 'supergroup');
-    } else if (activeDiscoveryFilter === 'channel') {
-        filtered = results.filter(r => r.chat_type === 'channel');
-    }
-
-    if (title) title.textContent = `Кваліфіковані результати (${filtered.length})`;
-
-    if (!filtered.length) {
-        grid.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); padding: 40px;">За цим фільтром нічого не знайдено.</div>`;
-        return;
-    }
-
-    grid.innerHTML = filtered.map(item => {
-        const isAdded = item.status === 'added_to_posting';
-        const isChecked = selectedDiscoveryPeers.has(item.telegram_peer);
-        const usernameClean = item.telegram_peer.replace(/^@/, '');
-
-        return `
-            <div class="discovery-card ${isAdded ? 'added' : ''}" id="disc-card-${item.id}">
-                <div class="discovery-card-header">
-                    <div style="display: flex; gap: 10px; align-items: center; min-width: 0;">
-                        <input type="checkbox" class="discovery-checkbox" data-id="${item.id}" data-peer="${item.telegram_peer}" data-title="${escapeHtml(item.title)}" onchange="toggleDiscoverySelection(this)" ${isChecked ? 'checked' : ''} ${isAdded ? 'disabled' : ''}>
-                        <div class="discovery-card-title">${escapeHtml(item.title)}</div>
-                    </div>
-                    <div class="discovery-score-badge ${item.classification}">${item.final_score}% збіг</div>
-                </div>
-
-                <div class="discovery-peer">${escapeHtml(item.telegram_peer)} • ${item.chat_type} • 👥 ${(item.members_count || 0).toLocaleString()} учасників</div>
-
-                ${item.description ? `<div class="discovery-desc">${escapeHtml(item.description)}</div>` : ''}
-
-                <!-- AI Metrics Bar -->
-                <div class="metric-row">
-                    <div class="metric-item">
-                        <div style="display: flex; justify-content: space-between;"><span>Релевантність</span> <span>${item.relevance_score}%</span></div>
-                        <div class="metric-bar-bg"><div class="metric-bar-fill" style="width: ${item.relevance_score}%; background: var(--accent-blue);"></div></div>
-                    </div>
-                    <div class="metric-item">
-                        <div style="display: flex; justify-content: space-between;"><span>Promo Score</span> <span>${item.promo_score}%</span></div>
-                        <div class="metric-bar-bg"><div class="metric-bar-fill" style="width: ${item.promo_score}%; background: #a855f7;"></div></div>
-                    </div>
-                    <div class="metric-item">
-                        <div style="display: flex; justify-content: space-between;"><span>Активність</span> <span>${item.activity_score}%</span></div>
-                        <div class="metric-bar-bg"><div class="metric-bar-fill" style="width: ${item.activity_score}%; background: var(--accent-green);"></div></div>
-                    </div>
-                </div>
-
-                <!-- AI Reason callout -->
-                <div class="ai-reason-box">
-                    💡 <strong>AI висновок:</strong> ${escapeHtml(item.ai_reason || 'Підходить за тематикою та інтентом')}
-                </div>
-
-                <!-- Actions -->
-                <div class="discovery-card-actions">
-                    <div style="display: flex; gap: 8px;">
-                        <a href="https://t.me/${usernameClean}" target="_blank" class="tg-btn tg-btn-secondary tg-btn-sm" style="text-decoration: none;">
-                            🔗 Відкрити
-                        </a>
-                        <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" onclick="hideDiscoveryCandidate('${item.id}')" title="Не показувати більше">
-                            👎 Приховати
-                        </button>
-                    </div>
-
-                    ${isAdded ? `
-                        <span style="color: var(--accent-green); font-size: 12px; font-weight: 600;">
-                            ✅ Додано в розсилку
-                        </span>
-                    ` : `
-                        <button type="button" class="tg-btn tg-btn-primary tg-btn-sm" id="btn-add-${item.id}" onclick="addDiscoverySingleChat('${item.id}', '${item.telegram_peer}', '${escapeHtml(item.title)}')">
-                            + Додати в розсилку
-                        </button>
-                    `}
-                </div>
-            </div>
-        `;
-    }).join('');
-}
-
-function toggleDiscoverySelection(cb) {
-    const peer = cb.getAttribute('data-peer');
-    if (cb.checked) {
-        selectedDiscoveryPeers.add(peer);
-    } else {
-        selectedDiscoveryPeers.delete(peer);
-    }
-    updateSelectedCountUI();
-}
-
-function updateSelectedCountUI() {
-    const count = selectedDiscoveryPeers.size;
-    const btn = document.getElementById('batchAddFoundBtn');
-    const span = document.getElementById('selectedCountSpan');
-    if (span) span.textContent = count;
-    if (btn) btn.style.display = (count > 0) ? 'inline-flex' : 'none';
-}
-
-async function addDiscoverySingleChat(resultId, peer, title) {
-    const interval = parseInt(document.getElementById('finderDefaultInterval').value, 10);
-    const postSelectVal = document.getElementById('finderDefaultPost')?.value;
-    const targetPostId = (postSelectVal === 'default') ? null : postSelectVal;
-    
-    const btn = document.getElementById(`btn-add-${resultId}`);
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = '⏳ Додаємо...';
-    }
-
-    try {
-        const res = await fetch('/api/discovery/add-to-posting', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                result_id: resultId,
-                chat_peer: peer,
-                interval_minutes: interval,
-                title: title,
-                post_id: targetPostId
-            })
-        });
-        const data = await res.json();
-        if (data.status === 'ok') {
-            if (btn) {
-                btn.outerHTML = `<span style="color: var(--accent-green); font-size: 12px; font-weight: 600;">✅ Додано в розсилку</span>`;
-            }
-            fetchChats();
-            fetchPosts();
-            fetchStatus();
-        } else {
-            alert('Помилка при додаванні: ' + (data.message || 'Невідома помилка'));
-            if (btn) {
-                btn.disabled = false;
-                btn.textContent = '+ Додати в розсилку';
-            }
-        }
-    } catch (err) {
-        alert('Помилка мережі: ' + err);
-        if (btn) {
-            btn.disabled = false;
-            btn.textContent = '+ Додати в розсилку';
-        }
-    }
-}
-
-async function hideDiscoveryCandidate(resultId) {
-    try {
-        await fetch('/api/discovery/hide', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ result_id: resultId })
-        });
-        const card = document.getElementById(`disc-card-${resultId}`);
-        if (card) {
-            card.style.opacity = '0';
-            card.style.transform = 'scale(0.95)';
-            setTimeout(() => card.remove(), 200);
-        }
-    } catch (err) {
-        console.error('Error hiding candidate:', err);
-    }
-}
-
-async function handleBatchAddDiscovery() {
-    if (!selectedDiscoveryPeers.size) return;
-
-    const interval = parseInt(document.getElementById('finderDefaultInterval').value, 10);
-    const postSelectVal = document.getElementById('finderDefaultPost')?.value;
-    const targetPostId = (postSelectVal === 'default') ? null : postSelectVal;
-
-    const checkboxes = document.querySelectorAll('.discovery-checkbox:checked:not(:disabled)');
-    const itemsToAdd = [];
-
-    checkboxes.forEach(cb => {
-        itemsToAdd.push({
-            result_id: cb.getAttribute('data-id'),
-            chat_peer: cb.getAttribute('data-peer'),
-            interval_minutes: interval,
-            title: cb.getAttribute('data-title') || '',
-            post_id: targetPostId
-        });
-    });
-
-    const btn = document.getElementById('batchAddFoundBtn');
-    btn.disabled = true;
-    btn.textContent = `⏳ Додаємо ${itemsToAdd.length} чатів...`;
-
-    try {
-        const res = await fetch('/api/discovery/batch-add', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ items: itemsToAdd })
-        });
-        const data = await res.json();
-        alert(`🎉 Успішно додано ${data.added_count} груп до вашої розсилки!`);
-        selectedDiscoveryPeers.clear();
-        updateSelectedCountUI();
-        fetchChats();
-        fetchPosts();
-        fetchStatus();
-        if (activeDiscoverySessionId) {
-            const r = await fetch(`/api/discovery/results/${activeDiscoverySessionId}`);
-            const d = await r.json();
-            renderDiscoveryCards(d.results || []);
-        }
-    } catch (err) {
-        alert('Помилка пакетного додавання: ' + err);
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = '📥 Додати всі вибрані (<span id="selectedCountSpan">0</span>)';
     }
 }
 

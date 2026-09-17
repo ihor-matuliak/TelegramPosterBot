@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 from config import config
 
 logger = logging.getLogger("Database")
@@ -24,7 +24,8 @@ class SupabaseDB:
             logger.error("Supabase URL or Key not set in configuration!")
             return
         try:
-            self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+            self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY,
+                                        options=ClientOptions(postgrest_client_timeout=20))
             logger.info("Supabase client successfully initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize Supabase client: {e}")
@@ -474,9 +475,28 @@ class SupabaseDB:
             logger.error(f"Error updating settings: {e}")
             return False
 
-    def toggle_poster(self, is_running: bool) -> bool:
+    def toggle_poster(self, is_running: bool, reason: Optional[str] = None) -> bool:
         """Enable or disable global posting worker."""
-        return self.update_settings({"is_running": is_running})
+        if not self.update_settings({"is_running": is_running}):
+            return False
+        status = "poster_resumed" if is_running else "poster_paused"
+        if not is_running and reason:
+            status = "circuit_breaker"
+        self.add_log("SYSTEM", status, reason or ("Розсилку увімкнено" if is_running else "Розсилку призупинено користувачем"))
+        return True
+
+    def get_poster_control_event(self) -> Optional[Dict[str, Any]]:
+        """Read the latest pause/resume cause, including across process restarts."""
+        if not self.client:
+            return None
+        try:
+            res = (self.client.table("logs").select("status,details,created_at")
+                   .in_("status", ["poster_resumed", "poster_paused", "circuit_breaker"])
+                   .order("created_at", desc=True).limit(1).execute())
+            return res.data[0] if res.data else None
+        except Exception as e:
+            logger.error(f"Error fetching poster control event: {e}")
+            return None
 
     # ==================== LOGS & STATS ====================
 

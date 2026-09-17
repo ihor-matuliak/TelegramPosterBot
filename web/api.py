@@ -1,8 +1,10 @@
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
@@ -12,8 +14,25 @@ from core.spintax import SpintaxEngine
 from core.finder import ChatFinder
 from core.poster import poster_worker
 from core.ai_discovery import AIDiscoveryEngine
+from web.discovery_api import router as discovery_router, manager as discovery_manager
+from database.discovery import DiscoveryStorageError
 
-web_app = FastAPI(title="Telegram Auto-Poster Dashboard")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await discovery_manager.restore()
+    try:
+        yield
+    finally:
+        await discovery_manager.close()
+
+
+web_app = FastAPI(title="Telegram Auto-Poster Dashboard", lifespan=lifespan)
+web_app.include_router(discovery_router)
+
+
+@web_app.exception_handler(DiscoveryStorageError)
+async def discovery_storage_error(request, exc: DiscoveryStorageError):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 web_app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -118,6 +137,7 @@ async def get_system_status():
         "is_authorized": is_authorized,
         "user": user_info,
         "is_running": settings.get("is_running", False),
+        "poster": poster_worker.get_status(settings, is_authorized, hourly_count, daily_count),
         "total_chats": len(chats),
         "active_chats": active_chats,
         "error_chats": error_chats,
@@ -131,14 +151,22 @@ async def get_system_status():
 async def toggle_poster():
     settings = db.get_settings()
     new_state = not settings.get("is_running", False)
-    db.toggle_poster(new_state)
+    if not db.toggle_poster(new_state):
+        raise HTTPException(status_code=503, detail="Не вдалося зберегти стан розсилки")
+    poster_worker.reset_errors()
     return {"is_running": new_state}
 
 
 @web_app.post("/api/settings")
 async def update_settings(req: SettingsUpdateRequest):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    db.update_settings(updates)
+    running = updates.pop("is_running", None)
+    if updates and not db.update_settings(updates):
+        raise HTTPException(status_code=503, detail="Не вдалося зберегти налаштування")
+    if running is not None:
+        if not db.toggle_poster(running):
+            raise HTTPException(status_code=503, detail="Не вдалося зберегти стан розсилки")
+        poster_worker.reset_errors()
     return {"status": "ok", "settings": db.get_settings()}
 
 
@@ -251,7 +279,7 @@ class GenerateTitleRequest(BaseModel):
 
 @web_app.post("/api/posts/generate-title")
 async def generate_post_title(req: GenerateTitleRequest):
-    title = AIDiscoveryEngine.generate_title_for_post(req.content)
+    title = await asyncio.to_thread(AIDiscoveryEngine.generate_title_for_post, req.content)
     return {"status": "ok", "title": title}
 
 
@@ -313,121 +341,12 @@ async def sync_saved_post(req: Optional[SyncSavedPostRequest] = None):
     }
 
 
-class DiscoverySearchRequest(BaseModel):
-    query: str
-    limit: Optional[int] = 40
-
-class DiscoveryAddToPostingRequest(BaseModel):
-    result_id: Optional[str] = None
-    chat_peer: str
-    interval_minutes: int = 60
-    title: Optional[str] = ""
-    post_id: Optional[str] = None
-
-class DiscoveryBatchAddRequest(BaseModel):
-    items: List[DiscoveryAddToPostingRequest]
-
-class DiscoveryHideRequest(BaseModel):
-    result_id: str
-
-
-# ==================== CONTEXTUAL AI DISCOVERY ====================
-
-@web_app.post("/api/discovery/search")
-async def start_discovery_search(req: DiscoverySearchRequest):
-    """Start an asynchronous AI-powered contextual discovery task."""
-    query = req.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Введіть пошуковий запит")
-
-    search_session = db.create_discovery_search(query)
-    if not search_session:
-        raise HTTPException(status_code=500, detail="Не вдалося створити сесію пошуку")
-
-    search_id = search_session["id"]
-    # Run in background
-    asyncio.create_task(ChatFinder.run_contextual_discovery(query, search_id, req.limit or 40))
-
-    return {
-        "status": "searching",
-        "search_id": search_id,
-        "query": query
-    }
-
-
-@web_app.get("/api/discovery/results/{search_id}")
-async def get_discovery_search_results(
-    search_id: str,
-    min_score: int = 0,
-    chat_type: str = "all",
-    status: str = "all"
-):
-    """Fetch progressive results for an active or completed discovery session."""
-    search_info = db.get_discovery_search(search_id)
-    if not search_info:
-        raise HTTPException(status_code=404, detail="Сесію пошуку не знайдено")
-
-    results = db.get_discovery_results(
-        search_id=search_id,
-        min_score=min_score,
-        chat_type=chat_type,
-        status=status
-    )
-
-    return {
-        "search": search_info,
-        "results": results,
-        "is_completed": search_info.get("status") in ["completed", "failed"]
-    }
-
-
-@web_app.post("/api/discovery/add-to-posting")
-async def discovery_add_to_posting(req: DiscoveryAddToPostingRequest):
-    """Join candidate chat and add to auto-poster schedule."""
-    res = await ChatFinder.join_and_add_chat(
-        peer_str=req.chat_peer,
-        interval_minutes=req.interval_minutes,
-        title=req.title or ""
-    )
-    if req.result_id and res.get("status") == "ok":
-        db.update_discovery_result_status(req.result_id, "added_to_posting")
-
-    return res
-
-
-@web_app.post("/api/discovery/batch-add")
-async def discovery_batch_add(req: DiscoveryBatchAddRequest):
-    """Batch join and add multiple candidate chats."""
-    added = 0
-    for item in req.items:
-        res = await ChatFinder.join_and_add_chat(
-            peer_str=item.chat_peer,
-            interval_minutes=item.interval_minutes,
-            title=item.title or ""
-        )
-        if res.get("status") == "ok":
-            added += 1
-            if item.result_id:
-                db.update_discovery_result_status(item.result_id, "added_to_posting")
-        await asyncio.sleep(0.5)
-
-    return {"status": "ok", "added_count": added}
-
-
-@web_app.post("/api/discovery/hide")
-async def discovery_hide_result(req: DiscoveryHideRequest):
-    """Hide an irrelevant discovery candidate."""
-    success = db.update_discovery_result_status(req.result_id, "hidden")
-    return {"status": "ok" if success else "error"}
-
-
 # ==================== CHAT FINDER & PARSER ====================
 
 @web_app.post("/api/finder/search")
 async def search_chats(req: SearchChatsRequest):
     """Search Telegram public groups by keywords."""
-    results = await ChatFinder.search_chats(req.query, req.limit or 40)
-    return {"status": "ok", "results": results}
+    raise HTTPException(status_code=410, detail="Використовуйте /api/discovery/search для безперервного пошуку.")
 
 
 @web_app.post("/api/finder/add")
