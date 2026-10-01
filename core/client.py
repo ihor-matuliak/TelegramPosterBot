@@ -111,39 +111,63 @@ class TelegramClientProxy:
 client = TelegramClientProxy(_create_raw_client())
 
 
-async def reset_client_session() -> bool:
+def cleanup_session_files(session_name: str | None = None):
+    """Completely remove SQLite session files from disk so fresh sessions can start cleanly."""
+    name = session_name or config.TELEGRAM_SESSION_NAME
+    patterns = [
+        f"{name}.session",
+        f"{name}.session-journal",
+        f"{name}.session.bak",
+        f"{name}.session.bak-journal",
+        "temp.session",
+        "temp.session-journal"
+    ]
+    for filename in patterns:
+        path = BASE_DIR / filename
+        if path.exists():
+            try:
+                path.unlink()
+                logger.info(f"Видалено файл сесії: {filename}")
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити {filename}: {e}")
+
+
+async def reset_client_session(delete_files: bool = True) -> bool:
     """
-    Safely disconnects client, backs up/removes broken session files,
-    creates a fresh client instance and connects it so it is ready for login.
+    Safely disconnects client, wipes/resets session files,
+    creates a fresh client instance and connects it so it is ready for login on any server.
     """
-    logger.info("Скидання та переініціалізація Telegram сесії...")
+    logger.info("Скидання та очищення Telegram сесії...")
     try:
         if client.is_connected():
             await client.disconnect()
     except Exception as e:
         logger.warning(f"Помилка відключення перед скиданням: {e}")
 
-    session_file = BASE_DIR / f"{config.TELEGRAM_SESSION_NAME}.session"
-    if session_file.exists():
-        backup_file = BASE_DIR / f"{config.TELEGRAM_SESSION_NAME}.session.bak"
-        try:
-            if backup_file.exists():
-                backup_file.unlink()
-            session_file.rename(backup_file)
-            logger.info(f"Старий файл сесії переміщено в {backup_file.name}")
-        except Exception as e:
-            logger.warning(f"Не вдалося перейменувати файл сесії, спроба видалення: {e}")
+    if delete_files:
+        cleanup_session_files()
+    else:
+        session_file = BASE_DIR / f"{config.TELEGRAM_SESSION_NAME}.session"
+        if session_file.exists():
+            backup_file = BASE_DIR / f"{config.TELEGRAM_SESSION_NAME}.session.bak"
             try:
-                session_file.unlink()
+                if backup_file.exists():
+                    backup_file.unlink()
+                session_file.rename(backup_file)
+                logger.info(f"Старий файл сесії переміщено в {backup_file.name}")
+            except Exception as e:
+                logger.warning(f"Не вдалося перейменувати файл сесії, спроба видалення: {e}")
+                try:
+                    session_file.unlink()
+                except Exception:
+                    pass
+
+        journal_file = BASE_DIR / f"{config.TELEGRAM_SESSION_NAME}.session-journal"
+        if journal_file.exists():
+            try:
+                journal_file.unlink()
             except Exception:
                 pass
-
-    journal_file = BASE_DIR / f"{config.TELEGRAM_SESSION_NAME}.session-journal"
-    if journal_file.exists():
-        try:
-            journal_file.unlink()
-        except Exception:
-            pass
 
     new_raw = _create_raw_client()
     client.set_target(new_raw)
@@ -157,14 +181,15 @@ async def reset_client_session() -> bool:
 
 
 async def logout_client() -> bool:
-    """Log out from current Telegram session and reinitialize a fresh client."""
+    """Log out from current Telegram session, terminate it on Telegram servers, and completely wipe local session files."""
     try:
         if client.is_connected() and await client.is_user_authorized():
             await client.log_out()
+            logger.info("Сесію успішно завершено на серверах Telegram (log_out).")
     except Exception as e:
         logger.warning(f"Помилка при виході з акаунту (log_out): {e}")
 
-    return await reset_client_session()
+    return await reset_client_session(delete_files=True)
 
 
 async def login_with_bot_token(bot_token: str | None = None, retry_on_auth_err: bool = True) -> dict:

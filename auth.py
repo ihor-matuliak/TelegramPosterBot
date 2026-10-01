@@ -12,7 +12,8 @@ from core.client import (
     init_telegram_client,
     normalize_phone,
     describe_sent_code_type,
-    login_with_bot_token
+    login_with_bot_token,
+    logout_client
 )
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -39,6 +40,8 @@ async def main():
         reauth = input("\nБажаєте змінити сесію або переавторизуватися? (y/N): ").strip().lower()
         if reauth != "y":
             return
+        print("🧹 Очищення та скидання попередньої сесії...")
+        await logout_client()
 
     print("\nОберіть спосіб авторизації:")
     print(f"  [1] ⚡ Авторизація через Bot Token (з BotFather) — без SMS і кодів!")
