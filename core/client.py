@@ -167,7 +167,7 @@ async def logout_client() -> bool:
     return await reset_client_session()
 
 
-async def login_with_bot_token(bot_token: str | None = None) -> dict:
+async def login_with_bot_token(bot_token: str | None = None, retry_on_auth_err: bool = True) -> dict:
     """
     Log in using a Telegram Bot Token (from BotFather).
     Does NOT require a phone number, SMS, or Telegram confirmation code.
@@ -212,10 +212,20 @@ async def login_with_bot_token(bot_token: str | None = None) -> dict:
                 "is_premium": False
             }
         }
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError) as e:
+        logger.warning(f"Конфлікт/помилка сесії ({type(e).__name__}). Скидаємо сесію...")
+        if retry_on_auth_err:
+            await reset_client_session()
+            return await login_with_bot_token(bot_token=bot_token, retry_on_auth_err=False)
+        return {"status": "error", "message": f"Помилка авторизації токена: {str(e)}"}
     except Exception as e:
+        err_msg = str(e)
+        if retry_on_auth_err and ("AuthKey" in err_msg or "session" in err_msg.lower() or "different IP addresses" in err_msg):
+            logger.warning(f"Виявлено недійсну сесію ({err_msg}). Автоматичне скидання сесії...")
+            await reset_client_session()
+            return await login_with_bot_token(bot_token=bot_token, retry_on_auth_err=False)
         logger.error(f"Помилка авторизації через Bot Token: {e}")
         return {"status": "error", "message": f"Помилка авторизації токена: {str(e)}"}
-
 
 
 async def init_telegram_client() -> TelegramClient:
@@ -235,7 +245,12 @@ async def init_telegram_client() -> TelegramClient:
         logger.warning(f"Сесійний ключ недійсний або дубльований ({type(e).__name__}). Автоматичне відновлення...")
         await reset_client_session()
     except Exception as e:
-        logger.error(f"Помилка з'єднання з Telegram MTProto: {e}")
+        err_msg = str(e)
+        if "AuthKey" in err_msg or "different IP addresses" in err_msg or "session" in err_msg.lower():
+            logger.warning(f"Сесійний ключ недійсний ({err_msg}). Автоматичне відновлення...")
+            await reset_client_session()
+        else:
+            logger.error(f"Помилка з'єднання з Telegram MTProto: {e}")
 
     try:
         if not await client.is_user_authorized():
@@ -243,8 +258,16 @@ async def init_telegram_client() -> TelegramClient:
         else:
             me = await client.get_me()
             logger.info(f"Telegram client connected as: {me.first_name} (@{me.username or 'no_username'}) [ID: {me.id}]")
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError) as e:
+        logger.warning(f"Сесія анульована при перевірці ({type(e).__name__}). Скидання сесії...")
+        await reset_client_session()
     except Exception as e:
-        logger.warning(f"Помилка перевірки авторизації: {e}")
+        err_msg = str(e)
+        if "AuthKey" in err_msg or "different IP addresses" in err_msg or "session" in err_msg.lower():
+            logger.warning(f"Сесія анульована ({err_msg}). Скидання сесії...")
+            await reset_client_session()
+        else:
+            logger.warning(f"Помилка перевірки авторизації: {e}")
 
     return client
 
