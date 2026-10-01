@@ -112,13 +112,17 @@ client = TelegramClientProxy(_create_raw_client())
 
 
 def cleanup_session_files(session_name: str | None = None):
-    """Completely remove SQLite session files from disk so fresh sessions can start cleanly."""
+    """Completely remove all SQLite session files from disk so fresh sessions can start cleanly."""
     name = session_name or config.TELEGRAM_SESSION_NAME
     patterns = [
         f"{name}.session",
         f"{name}.session-journal",
         f"{name}.session.bak",
         f"{name}.session.bak-journal",
+        "poster_session.session",
+        "poster_session.session-journal",
+        "poster_session.session.bak",
+        "poster_session.session.bak-journal",
         "temp.session",
         "temp.session-journal"
     ]
@@ -131,14 +135,35 @@ def cleanup_session_files(session_name: str | None = None):
             except Exception as e:
                 logger.warning(f"Не вдалося видалити {filename}: {e}")
 
+    try:
+        for p in BASE_DIR.glob("*.session*"):
+            try:
+                if p.is_file():
+                    p.unlink()
+                    logger.info(f"Видалено залишковий файл сесії: {p.name}")
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити {p.name}: {e}")
+    except Exception:
+        pass
+
 
 async def reset_client_session(delete_files: bool = True) -> bool:
     """
-    Safely disconnects client, wipes/resets session files,
+    Safely disconnects client, closes SQLite session handle, wipes session files from disk,
     creates a fresh client instance and connects it so it is ready for login on any server.
     """
     logger.info("Скидання та очищення Telegram сесії...")
     try:
+        target = client.get_target() if hasattr(client, "get_target") else None
+        if target:
+            if hasattr(target, "session") and target.session:
+                try:
+                    if hasattr(target.session, "delete"):
+                        target.session.delete()
+                    if hasattr(target.session, "close"):
+                        target.session.close()
+                except Exception:
+                    pass
         if client.is_connected():
             await client.disconnect()
     except Exception as e:
@@ -203,7 +228,12 @@ async def login_with_bot_token(bot_token: str | None = None, retry_on_auth_err: 
 
     try:
         if not client.is_connected():
-            await client.connect()
+            try:
+                await client.connect()
+            except Exception as conn_err:
+                logger.warning(f"Не вдалося підключити клієнт ({conn_err}), скидаємо сесію...")
+                await reset_client_session(delete_files=True)
+
         await client.sign_in(bot_token=token)
         me = await client.get_me()
         logger.info(f"Успішна авторизація через Bot Token: {me.first_name} (@{me.username}) [ID: {me.id}]")
@@ -238,16 +268,16 @@ async def login_with_bot_token(bot_token: str | None = None, retry_on_auth_err: 
             }
         }
     except (AuthKeyDuplicatedError, AuthKeyUnregisteredError, SessionRevokedError) as e:
-        logger.warning(f"Конфлікт/помилка сесії ({type(e).__name__}). Скидаємо сесію...")
+        logger.warning(f"Конфлікт/помилка сесії ({type(e).__name__}). Повне видалення сесії та повторна спроба...")
         if retry_on_auth_err:
-            await reset_client_session()
+            await reset_client_session(delete_files=True)
             return await login_with_bot_token(bot_token=bot_token, retry_on_auth_err=False)
         return {"status": "error", "message": f"Помилка авторизації токена: {str(e)}"}
     except Exception as e:
         err_msg = str(e)
-        if retry_on_auth_err and ("AuthKey" in err_msg or "session" in err_msg.lower() or "different IP addresses" in err_msg):
-            logger.warning(f"Виявлено недійсну сесію ({err_msg}). Автоматичне скидання сесії...")
-            await reset_client_session()
+        if retry_on_auth_err and ("AuthKey" in err_msg or "session" in err_msg.lower() or "different IP" in err_msg):
+            logger.warning(f"Виявлено недійсну сесію ({err_msg}). Повне видалення сесії та повторна спроба...")
+            await reset_client_session(delete_files=True)
             return await login_with_bot_token(bot_token=bot_token, retry_on_auth_err=False)
         logger.error(f"Помилка авторизації через Bot Token: {e}")
         return {"status": "error", "message": f"Помилка авторизації токена: {str(e)}"}
