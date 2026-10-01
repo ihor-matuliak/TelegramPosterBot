@@ -1,6 +1,7 @@
 # Environment and secrets
 .env
 *.session
+*.session.bak
 *.session-journal
 
 # Python virtual environment & cache
