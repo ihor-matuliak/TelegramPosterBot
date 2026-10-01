@@ -21,10 +21,11 @@ class Config:
     
     @classmethod
     def get_admin_ids(cls) -> List[int]:
-        if not cls._ADMIN_IDS_RAW:
+        raw = os.getenv("ADMIN_USER_IDS", cls._ADMIN_IDS_RAW).strip().strip('"').strip("'")
+        if not raw:
             return []
         try:
-            return [int(x.strip()) for x in cls._ADMIN_IDS_RAW.split(",") if x.strip()]
+            return [int(x.strip()) for x in raw.split(",") if x.strip()]
         except ValueError:
             return []
 

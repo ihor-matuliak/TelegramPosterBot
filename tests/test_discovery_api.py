@@ -8,6 +8,9 @@ telegram_module = sys.modules.setdefault("core.client", ModuleType("core.client"
 telegram_module.client = MagicMock()
 telegram_module.simulate_typing = AsyncMock()
 telegram_module.get_latest_saved_message = AsyncMock()
+telegram_module.init_telegram_client = AsyncMock()
+telegram_module.reset_client_session = AsyncMock()
+telegram_module.logout_client = AsyncMock()
 
 from fastapi.testclient import TestClient
 from web.api import web_app

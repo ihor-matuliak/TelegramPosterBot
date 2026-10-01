@@ -11,6 +11,10 @@ let currentPostId = null;
 let currentSourceMsgId = null;
 let currentSourceChat = 'me';
 let foundChatsData = [];
+let isAuthorized = false;
+let currentUser = null;
+let currentAuthPhone = '';
+let currentPhoneCodeHash = '';
 
 document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
@@ -61,6 +65,65 @@ function initEventListeners() {
     const toggleBtn = document.getElementById('masterToggleBtn');
     toggleBtn.addEventListener('click', toggleMasterPoster);
 
+    // Auth Action Buttons
+    const headerAuthBtn = document.getElementById('headerAuthBtn');
+    if (headerAuthBtn) headerAuthBtn.addEventListener('click', handleHeaderAuthClick);
+
+    const bannerAuthBtn = document.getElementById('bannerAuthBtn');
+    if (bannerAuthBtn) bannerAuthBtn.addEventListener('click', () => openAuthModal());
+
+    const settingsLoginBtn = document.getElementById('settingsLoginBtn');
+    if (settingsLoginBtn) settingsLoginBtn.addEventListener('click', () => openAuthModal());
+
+    const settingsLogoutBtn = document.getElementById('settingsLogoutBtn');
+    if (settingsLogoutBtn) settingsLogoutBtn.addEventListener('click', handleLogout);
+
+    const settingsResetBtn = document.getElementById('settingsResetBtn');
+    if (settingsResetBtn) settingsResetBtn.addEventListener('click', handleResetSession);
+
+    const accountLogoutBtn = document.getElementById('accountLogoutBtn');
+    if (accountLogoutBtn) accountLogoutBtn.addEventListener('click', handleLogout);
+
+    // Auth Step Action Buttons
+    const loginBotTokenBtn = document.getElementById('authLoginBotTokenBtn');
+    if (loginBotTokenBtn) loginBotTokenBtn.addEventListener('click', handleAuthLoginBotToken);
+
+    const sendCodeBtn = document.getElementById('authSendCodeBtn');
+    if (sendCodeBtn) sendCodeBtn.addEventListener('click', handleAuthSendCode);
+
+    const verifyCodeBtn = document.getElementById('authVerifyCodeBtn');
+    if (verifyCodeBtn) verifyCodeBtn.addEventListener('click', handleAuthVerifyCode);
+
+    const verify2faBtn = document.getElementById('authVerify2faBtn');
+    if (verify2faBtn) verify2faBtn.addEventListener('click', handleAuthVerify2FA);
+
+    const doneBtn = document.getElementById('authDoneBtn');
+    if (doneBtn) doneBtn.addEventListener('click', () => closeModal());
+
+    const changePhoneBtn = document.getElementById('authChangePhoneBtn');
+    if (changePhoneBtn) changePhoneBtn.addEventListener('click', () => showAuthStep(1));
+
+    const toggle2faBtn = document.getElementById('toggle2faVisibilityBtn');
+    if (toggle2faBtn) toggle2faBtn.addEventListener('click', toggle2faVisibility);
+
+    // Enter key shortcuts in auth inputs
+    const botTokenInp = document.getElementById('authBotTokenInput');
+    if (botTokenInp) botTokenInp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); handleAuthLoginBotToken(); }
+    });
+    const phoneInp = document.getElementById('authPhoneInput');
+    if (phoneInp) phoneInp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); handleAuthSendCode(); }
+    });
+    const codeInp = document.getElementById('authCodeInput');
+    if (codeInp) codeInp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); handleAuthVerifyCode(); }
+    });
+    const passInp = document.getElementById('auth2faInput');
+    if (passInp) passInp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); handleAuthVerify2FA(); }
+    });
+
     // Add Chat Modal
     document.getElementById('openAddChatModalBtn').addEventListener('click', () => {
         updateModalPostSelects();
@@ -74,6 +137,13 @@ function initEventListeners() {
     // Close Modals
     document.querySelectorAll('.close-modal-btn').forEach(btn => {
         btn.addEventListener('click', () => closeModal());
+    });
+
+    // Close modal on click outside
+    document.querySelectorAll('.modal-overlay').forEach(overlay => {
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) closeModal();
+        });
     });
 
     // Form Submissions
@@ -121,13 +191,73 @@ async function fetchStatus() {
         // Update User & Premium info
         const userSubtitle = document.getElementById('userSubtitle');
         const premiumBadge = document.getElementById('premiumBadge');
-        if (data.is_authorized && data.user) {
-            userSubtitle.textContent = `👤 ${data.user.name} (@${data.user.username || 'без юзернейму'})`;
-            if (data.user.is_premium) {
+        const headerAuthBtn = document.getElementById('headerAuthBtn');
+        const headerAuthIcon = document.getElementById('headerAuthIcon');
+        const headerAuthBtnText = document.getElementById('headerAuthBtnText');
+        const unauthBanner = document.getElementById('unauthAlertBanner');
+
+        // Settings tab account card
+        const settingsAuthBadge = document.getElementById('settingsAuthBadge');
+        const settingsAccName = document.getElementById('settingsAccName');
+        const settingsAccPhone = document.getElementById('settingsAccPhone');
+        const settingsLoginBtn = document.getElementById('settingsLoginBtn');
+        const settingsLogoutBtn = document.getElementById('settingsLogoutBtn');
+
+        isAuthorized = !!data.is_authorized;
+        currentUser = data.user || null;
+
+        if (isAuthorized && currentUser) {
+            userSubtitle.innerHTML = `👤 <span>${escapeHtml(currentUser.name)}</span> <span style="color: var(--accent-blue-hover)">(@${escapeHtml(currentUser.username || 'без юзернейму')})</span>`;
+            if (currentUser.is_premium) {
                 premiumBadge.style.display = 'inline-block';
+            } else {
+                premiumBadge.style.display = 'none';
             }
+
+            if (headerAuthBtn) {
+                headerAuthBtn.className = 'header-auth-btn auth';
+                if (headerAuthIcon) headerAuthIcon.textContent = '👤';
+                if (headerAuthBtnText) headerAuthBtnText.textContent = currentUser.name || 'Акаунт';
+                headerAuthBtn.title = 'Керування акаунтом Telegram';
+            }
+
+            if (unauthBanner) unauthBanner.style.display = 'none';
+
+            if (settingsAuthBadge) {
+                settingsAuthBadge.className = 'auth-status-badge auth';
+                settingsAuthBadge.textContent = '🟢 Авторизовано';
+            }
+            if (settingsAccName) settingsAccName.textContent = currentUser.name;
+            if (settingsAccPhone) {
+                const phoneStr = currentUser.phone ? `+${currentUser.phone}` : '';
+                const userStr = currentUser.username ? ` (@${currentUser.username})` : '';
+                settingsAccPhone.textContent = `${phoneStr}${userStr} • Сесія активна (MTProto)`;
+            }
+            if (settingsLoginBtn) settingsLoginBtn.style.display = 'none';
+            if (settingsLogoutBtn) settingsLogoutBtn.style.display = 'inline-block';
+
         } else {
-            userSubtitle.textContent = `⚠️ Не авторизовано (запустіть python auth.py)`;
+            userSubtitle.innerHTML = `⚠️ <span style="color: #ef5350;">Не авторизовано</span> <button type="button" id="subtitleAuthBtn" class="auth-link-btn" onclick="openAuthModal()">[Увійти в акаунт]</button>`;
+
+            if (premiumBadge) premiumBadge.style.display = 'none';
+
+            if (headerAuthBtn) {
+                headerAuthBtn.className = 'header-auth-btn unauth';
+                if (headerAuthIcon) headerAuthIcon.textContent = '🔑';
+                if (headerAuthBtnText) headerAuthBtnText.textContent = 'Увійти';
+                headerAuthBtn.title = 'Авторизуватись у Telegram';
+            }
+
+            if (unauthBanner) unauthBanner.style.display = 'flex';
+
+            if (settingsAuthBadge) {
+                settingsAuthBadge.className = 'auth-status-badge unauth';
+                settingsAuthBadge.textContent = '⚠️ Не авторизовано';
+            }
+            if (settingsAccName) settingsAccName.textContent = 'Акаунт не підключено';
+            if (settingsAccPhone) settingsAccPhone.textContent = 'Для публікації оголошень потрібна авторизація';
+            if (settingsLoginBtn) settingsLoginBtn.style.display = 'inline-block';
+            if (settingsLogoutBtn) settingsLogoutBtn.style.display = 'none';
         }
 
         // Update Master Toggle
@@ -834,7 +964,8 @@ async function fetchLogs() {
 // ==================== UTILS ====================
 
 function openModal(modalId) {
-    document.getElementById(modalId).classList.add('active');
+    const modal = document.getElementById(modalId);
+    if (modal) modal.classList.add('active');
 }
 
 function closeModal() {
@@ -849,4 +980,280 @@ function escapeHtml(str) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+}
+
+// ==================== TELEGRAM UI AUTHENTICATION ====================
+
+function handleHeaderAuthClick() {
+    if (isAuthorized && currentUser) {
+        openAccountModal(currentUser);
+    } else {
+        openAuthModal();
+    }
+}
+
+function openAuthModal() {
+    showAuthStep(1);
+    clearAuthErrors();
+    const phoneInput = document.getElementById('authPhoneInput');
+    phoneInput.value = currentAuthPhone || '+380';
+    openModal('authModal');
+    setTimeout(() => phoneInput.focus(), 150);
+}
+
+function openAccountModal(user) {
+    if (!user) return;
+    document.getElementById('accName').textContent = user.name || 'Telegram Користувач';
+    document.getElementById('accUsername').textContent = user.username ? `@${user.username}` : '@без юзернейму';
+    document.getElementById('accPhone').textContent = user.phone ? `+${user.phone}` : '';
+    const premBadge = document.getElementById('accPremiumBadge');
+    if (premBadge) {
+        premBadge.style.display = user.is_premium ? 'inline-block' : 'none';
+    }
+    openModal('accountModal');
+}
+
+function showAuthStep(stepNumber) {
+    clearAuthErrors();
+    [1, 2, 3, 4].forEach(s => {
+        const el = document.getElementById(`authStep${s}`);
+        if (el) el.classList.toggle('active', s === stepNumber);
+    });
+
+    if (stepNumber === 1) {
+        setTimeout(() => document.getElementById('authPhoneInput').focus(), 150);
+    } else if (stepNumber === 2) {
+        const codeInput = document.getElementById('authCodeInput');
+        codeInput.value = '';
+        setTimeout(() => codeInput.focus(), 150);
+    } else if (stepNumber === 3) {
+        const passInput = document.getElementById('auth2faInput');
+        passInput.value = '';
+        setTimeout(() => passInput.focus(), 150);
+    }
+}
+
+function clearAuthErrors() {
+    [1, 2, 3].forEach(s => {
+        const errEl = document.getElementById(`authStep${s}Error`);
+        if (errEl) {
+            errEl.style.display = 'none';
+            errEl.textContent = '';
+        }
+    });
+}
+
+function showAuthError(stepNumber, message) {
+    const errEl = document.getElementById(`authStep${stepNumber}Error`);
+    if (errEl) {
+        errEl.textContent = message;
+        errEl.style.display = 'block';
+    }
+}
+
+async function handleAuthLoginBotToken() {
+    clearAuthErrors();
+    const tokenInput = document.getElementById('authBotTokenInput');
+    const token = tokenInput ? tokenInput.value.trim() : '';
+
+    const btn = document.getElementById('authLoginBotTokenBtn');
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span>⏳ Авторизація через Bot Token...</span>';
+    }
+
+    try {
+        const res = await fetch('/api/auth/login-bot-token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bot_token: token || null })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.detail || 'Не вдалося авторизувати токен бота');
+        }
+        handleAuthSuccess(data.user);
+    } catch (err) {
+        showAuthError(1, err.message || 'Помилка авторизації токена бота');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<span>⚡ Авторизуватись через Bot Token</span>';
+        }
+    }
+}
+
+async function handleAuthSendCode() {
+    clearAuthErrors();
+    const phoneInput = document.getElementById('authPhoneInput');
+    const phone = phoneInput.value.trim();
+    if (!phone || phone.length < 8) {
+        showAuthError(1, 'Введіть коректний номер телефону у міжнародному форматі (наприклад: +380991234567)');
+        phoneInput.focus();
+        return;
+    }
+
+    const btn = document.getElementById('authSendCodeBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span>⏳ Запит коду...</span>';
+
+    try {
+        const res = await fetch('/api/auth/send-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.detail || 'Не вдалося надіслати код');
+        }
+
+        currentAuthPhone = data.phone || phone;
+        currentPhoneCodeHash = data.phone_code_hash || '';
+        document.getElementById('authPhoneDisplay').textContent = currentAuthPhone;
+        const deliveryNotice = document.getElementById('authDeliveryNotice');
+        if (deliveryNotice && data.delivery_text) {
+            deliveryNotice.innerHTML = `📬 <strong>Куди надіслано:</strong> ${data.delivery_text}.<br><span style="color: #e5a93c;">⚠️ Код надходить у додаток Telegram (чат «Telegram» з синьою галочкою), а НЕ в SMS!</span>`;
+        }
+        showAuthStep(2);
+    } catch (err) {
+        showAuthError(1, err.message || 'Помилка надсилання коду підтвердження');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span>Отримати код</span>';
+    }
+}
+
+async function handleAuthVerifyCode() {
+    clearAuthErrors();
+    const codeInput = document.getElementById('authCodeInput');
+    const code = codeInput.value.trim();
+    if (!code) {
+        showAuthError(2, 'Введіть код підтвердження');
+        codeInput.focus();
+        return;
+    }
+
+    const btn = document.getElementById('authVerifyCodeBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span>⏳ Перевірка...</span>';
+
+    try {
+        const res = await fetch('/api/auth/verify-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                phone: currentAuthPhone,
+                code: code,
+                phone_code_hash: currentPhoneCodeHash
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.detail || 'Помилка перевірки коду');
+        }
+
+        if (data.status === 'needs_2fa') {
+            showAuthStep(3);
+        } else if (data.status === 'ok') {
+            handleAuthSuccess(data.user);
+        }
+    } catch (err) {
+        showAuthError(2, err.message || 'Невірний код підтвердження');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span>Підтвердити</span>';
+    }
+}
+
+async function handleAuthVerify2FA() {
+    clearAuthErrors();
+    const passInput = document.getElementById('auth2faInput');
+    const password = passInput.value;
+    if (!password) {
+        showAuthError(3, 'Введіть хмарний пароль 2FA');
+        passInput.focus();
+        return;
+    }
+
+    const btn = document.getElementById('authVerify2faBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span>⏳ Перевірка...</span>';
+
+    try {
+        const res = await fetch('/api/auth/verify-2fa', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.detail || 'Невірний пароль 2FA');
+        }
+
+        if (data.status === 'ok') {
+            handleAuthSuccess(data.user);
+        }
+    } catch (err) {
+        showAuthError(3, err.message || 'Помилка 2FA авторизації');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span>Увійти</span>';
+    }
+}
+
+function handleAuthSuccess(user) {
+    const detailsEl = document.getElementById('authSuccessDetails');
+    if (user && detailsEl) {
+        detailsEl.innerHTML = `
+            <div>Ви успішно увійшли як: <strong>${escapeHtml(user.name)}</strong> (@${escapeHtml(user.username || 'без юзернейму')})</div>
+            <div style="font-size: 13px; color: var(--accent-green); margin-top: 6px;">🟢 Сесія збережена і готова до роботи!</div>
+        `;
+    }
+    showAuthStep(4);
+    fetchStatus();
+    fetchChats();
+}
+
+function toggle2faVisibility() {
+    const passInput = document.getElementById('auth2faInput');
+    const btn = document.getElementById('toggle2faVisibilityBtn');
+    if (passInput.type === 'password') {
+        passInput.type = 'text';
+        btn.textContent = '🙈';
+    } else {
+        passInput.type = 'password';
+        btn.textContent = '👁️';
+    }
+}
+
+async function handleLogout() {
+    if (!confirm('Ви дійсно бажаєте вийти з Telegram акаунту? Поточну сесію буде видалено.')) {
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/auth/logout', { method: 'POST' });
+        const data = await res.json();
+        closeModal();
+        alert(data.message || 'Ви успішно вийшли з акаунту');
+        fetchStatus();
+    } catch (err) {
+        alert('Помилка при виході з акаунту: ' + err);
+    }
+}
+
+async function handleResetSession() {
+    if (!confirm('Скинути файл сесії? Це видалить застарілий сесійний ключ і перепідключить клієнт Telegram.')) {
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/auth/reset-session', { method: 'POST' });
+        const data = await res.json();
+        alert(data.message || 'Сесію скинуто');
+        fetchStatus();
+    } catch (err) {
+        alert('Помилка скидання сесії: ' + err);
+    }
 }

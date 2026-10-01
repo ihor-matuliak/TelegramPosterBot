@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -8,14 +9,63 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
+from telethon.errors import (
+    FloodWaitError,
+    PhoneNumberInvalidError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    SessionPasswordNeededError,
+    PasswordHashInvalidError,
+    PhoneNumberBannedError
+)
 from database.client import db
-from core.client import client, get_latest_saved_message
+from core.client import (
+    client,
+    init_telegram_client,
+    reset_client_session,
+    logout_client,
+    login_with_bot_token,
+    get_latest_saved_message
+)
+
+try:
+    from core.client import normalize_phone, describe_sent_code_type
+except ImportError:
+    normalize_phone = None
+    describe_sent_code_type = None
+
+if not normalize_phone:
+    def normalize_phone(raw: str) -> str:
+        clean = "".join(ch for ch in str(raw).strip() if ch.isdigit() or ch == "+")
+        digits = clean[1:] if clean.startswith("+") else clean
+        if not digits:
+            return ""
+        if len(digits) == 10 and digits.startswith("0"):
+            return f"+38{digits}"
+        if len(digits) == 12 and digits.startswith("380"):
+            return f"+{digits}"
+        if len(digits) == 11 and digits.startswith("80"):
+            return f"+3{digits}"
+        return f"+{digits}"
+
+if not describe_sent_code_type:
+    def describe_sent_code_type(sent_code_type) -> str:
+        type_name = type(sent_code_type).__name__ if sent_code_type else ""
+        if "App" in type_name:
+            return "у додаток Telegram (офіційний системний чат «Telegram» з синьою галочкою від сервісу 777000)"
+        elif "Sms" in type_name:
+            return "у звичайне SMS-повідомлення на ваш телефонний номер"
+        return "у додаток Telegram (офіційний системний чат «Telegram»)"
+
 from core.spintax import SpintaxEngine
 from core.finder import ChatFinder
 from core.poster import poster_worker
 from core.ai_discovery import AIDiscoveryEngine
 from web.discovery_api import router as discovery_router, manager as discovery_manager
 from database.discovery import DiscoveryStorageError
+
+logger = logging.getLogger("WebAPI")
+_pending_auth: dict[str, str] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -104,6 +154,21 @@ class SettingsUpdateRequest(BaseModel):
     auto_circuit_breaker: Optional[bool] = None
 
 
+class PhoneAuthRequest(BaseModel):
+    phone: str
+
+class VerifyCodeRequest(BaseModel):
+    phone: str
+    code: str
+    phone_code_hash: Optional[str] = None
+
+class Verify2FARequest(BaseModel):
+    password: str
+
+class BotTokenAuthRequest(BaseModel):
+    bot_token: Optional[str] = None
+
+
 @web_app.get("/")
 async def serve_index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -114,17 +179,20 @@ async def get_system_status():
     is_authorized = False
     user_info = None
     try:
+        if not client.is_connected():
+            await init_telegram_client()
         if client.is_connected() and await client.is_user_authorized():
             is_authorized = True
             me = await client.get_me()
             user_info = {
+                "id": me.id,
                 "name": f"{me.first_name} {me.last_name or ''}".strip(),
                 "username": me.username,
                 "phone": me.phone,
                 "is_premium": getattr(me, "premium", False)
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Error during Telegram client status check: {e}")
 
     settings = db.get_settings()
     chats = db.get_all_chats()
@@ -378,3 +446,168 @@ async def finder_batch_add(req: BatchJoinAddRequest):
 @web_app.get("/api/logs")
 async def get_logs(limit: int = 50):
     return db.get_recent_logs(limit)
+
+
+# ==================== TELEGRAM UI AUTHENTICATION ====================
+
+@web_app.post("/api/auth/send-code")
+async def send_auth_code(data: PhoneAuthRequest):
+    """
+    Step 1 of Telegram authentication: Request MTProto confirmation code to phone number.
+    """
+    phone = normalize_phone(data.phone)
+    if not phone or len(phone) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Введіть коректний номер телефону (наприклад: +380991234567 або 0991234567)"
+        )
+
+    try:
+        if not client.is_connected():
+            await init_telegram_client()
+
+        sent_code = await client.send_code_request(phone)
+        _pending_auth[phone] = sent_code.phone_code_hash
+        target_desc = describe_sent_code_type(sent_code.type)
+
+        return {
+            "status": "ok",
+            "phone": phone,
+            "phone_code_hash": sent_code.phone_code_hash,
+            "delivery_type": type(sent_code.type).__name__ if sent_code.type else "App",
+            "delivery_text": target_desc,
+            "message": f"Код надіслано {target_desc}."
+        }
+    except PhoneNumberInvalidError:
+        raise HTTPException(status_code=400, detail="Невірний номер телефону. Перевірте формат і спробуйте знову.")
+    except PhoneNumberBannedError:
+        raise HTTPException(status_code=400, detail="Цей номер телефону заблоковано в Telegram.")
+    except FloodWaitError as e:
+        raise HTTPException(status_code=429, detail=f"Забагато спроб. Telegram просить зачекати {e.seconds} сек перед повторною спробою.")
+    except Exception as e:
+        logger.error(f"Помилка надсилання коду для {phone}: {e}")
+        err_msg = str(e)
+        if "AuthKey" in err_msg or "session" in err_msg.lower():
+            await reset_client_session()
+            raise HTTPException(status_code=500, detail="Сесію відновлено після збою ключа. Будь ласка, спробуйте знову.")
+        raise HTTPException(status_code=400, detail=f"Помилка надсилання коду: {err_msg}")
+
+
+@web_app.post("/api/auth/verify-code")
+async def verify_auth_code(data: VerifyCodeRequest):
+    """
+    Step 2 of Telegram authentication: Verify confirmation code received via Telegram or SMS.
+    """
+    phone = normalize_phone(data.phone)
+    code = data.code.strip().replace(" ", "").replace("-", "")
+    phone_code_hash = data.phone_code_hash or _pending_auth.get(phone)
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Введіть код підтвердження")
+
+    try:
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+    except SessionPasswordNeededError:
+        return {
+            "status": "needs_2fa",
+            "message": "Для вашого акаунта активовано двоетапну перевірку (2FA). Будь ласка, введіть хмарний пароль."
+        }
+    except PhoneCodeInvalidError:
+        raise HTTPException(status_code=400, detail="Невірний код підтвердження! Перевірте цифри та спробуйте ще раз.")
+    except PhoneCodeExpiredError:
+        raise HTTPException(status_code=400, detail="Термін дії коду закінчився. Запитайте новий код.")
+    except FloodWaitError as e:
+        raise HTTPException(status_code=429, detail=f"Забагато спроб. Зачекайте {e.seconds} секунд.")
+    except Exception as e:
+        logger.error(f"Помилка підтвердження коду: {e}")
+        raise HTTPException(status_code=400, detail=f"Помилка авторизації: {str(e)}")
+
+    _pending_auth.pop(phone, None)
+    me = await client.get_me()
+    return {
+        "status": "ok",
+        "message": "Авторизація успішна!",
+        "user": {
+            "id": me.id,
+            "name": f"{me.first_name} {me.last_name or ''}".strip(),
+            "username": me.username,
+            "phone": me.phone,
+            "is_premium": getattr(me, "premium", False)
+        }
+    }
+
+
+@web_app.post("/api/auth/verify-2fa")
+async def verify_auth_2fa(data: Verify2FARequest):
+    """
+    Step 3 of Telegram authentication (optional): Verify 2FA Cloud Password if enabled.
+    """
+    password = data.password.strip()
+    if not password:
+        raise HTTPException(status_code=400, detail="Введіть 2FA пароль")
+
+    try:
+        await client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        raise HTTPException(status_code=400, detail="Невірний пароль 2FA! Перевірте пароль і спробуйте знову.")
+    except FloodWaitError as e:
+        raise HTTPException(status_code=429, detail=f"Забагато спроб. Зачекайте {e.seconds} секунд.")
+    except Exception as e:
+        logger.error(f"Помилка 2FA авторизації: {e}")
+        raise HTTPException(status_code=400, detail=f"Помилка 2FA авторизації: {str(e)}")
+
+    _pending_auth.clear()
+    me = await client.get_me()
+    return {
+        "status": "ok",
+        "message": "Авторизація успішна!",
+        "user": {
+            "id": me.id,
+            "name": f"{me.first_name} {me.last_name or ''}".strip(),
+            "username": me.username,
+            "phone": me.phone,
+            "is_premium": getattr(me, "premium", False)
+        }
+    }
+
+
+@web_app.post("/api/auth/logout")
+async def handle_logout():
+    """Log out of Telegram account and reset session."""
+    success = await logout_client()
+    if success:
+        try:
+            from bot.admin_bot import notify_admins
+            await notify_admins(
+                "🚪 <b>Сесію Telegram Userbot завершено!</b>\n\n"
+                "Користувач вийшов з акаунту через веб-панель. Для розсилки потрібна нова авторизація."
+            )
+        except Exception:
+            pass
+    return {
+        "status": "ok" if success else "error",
+        "message": "Ви успішно вийшли з Telegram акаунту" if success else "Помилка виходу з акаунту"
+    }
+
+
+@web_app.post("/api/auth/reset-session")
+async def handle_reset_session():
+    """Reset session file and reconnect fresh client."""
+    success = await reset_client_session()
+    return {
+        "status": "ok" if success else "error",
+        "message": "Сесію успішно скинуто, готово до повторної авторизації" if success else "Не вдалося скинути файл сесії"
+    }
+
+
+@web_app.post("/api/auth/login-bot-token")
+async def handle_login_bot_token(req: Optional[BotTokenAuthRequest] = None):
+    """
+    Log in immediately using a Telegram Bot Token (from BotFather).
+    Does NOT require a phone number or SMS/Telegram verification code.
+    """
+    token = req.bot_token if req and req.bot_token else None
+    res = await login_with_bot_token(token)
+    if res.get("status") != "ok":
+        raise HTTPException(status_code=400, detail=res.get("message", "Помилка авторизації бота"))
+    return res

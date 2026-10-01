@@ -23,8 +23,53 @@ from bot.keyboards import (
     get_post_assign_menu_keyboard,
     get_back_keyboard,
     get_back_to_posts_keyboard,
-    get_cb_action
+    get_cb_action,
+    get_auth_menu_keyboard,
+    get_cancel_auth_keyboard
 )
+from telethon.errors import (
+    PhoneNumberInvalidError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    SessionPasswordNeededError,
+    PasswordHashInvalidError,
+    FloodWaitError
+)
+from core.client import (
+    client,
+    init_telegram_client,
+    reset_client_session,
+    logout_client,
+    login_with_bot_token
+)
+
+try:
+    from core.client import normalize_phone, describe_sent_code_type
+except ImportError:
+    normalize_phone = None
+    describe_sent_code_type = None
+
+if not normalize_phone:
+    def normalize_phone(raw: str) -> str:
+        clean = "".join(ch for ch in str(raw).strip() if ch.isdigit() or ch == "+")
+        digits = clean[1:] if clean.startswith("+") else clean
+        if not digits:
+            return ""
+        if len(digits) == 10 and digits.startswith("0"):
+            return f"+38{digits}"
+        if len(digits) == 12 and digits.startswith("380"):
+            return f"+{digits}"
+        if len(digits) == 11 and digits.startswith("80"):
+            return f"+3{digits}"
+        return f"+{digits}"
+
+if not describe_sent_code_type:
+    def describe_sent_code_type(sent_code_type) -> str:
+        type_name = type(sent_code_type).__name__ if sent_code_type else ""
+        if "App" in type_name:
+            return "у додаток Telegram (офіційний системний чат «Telegram» з синьою галочкою від сервісу 777000)"
+        return "у додаток Telegram (офіційний системний чат «Telegram»)"
+
 
 logger = logging.getLogger("AdminBot")
 router = Router()
@@ -40,6 +85,13 @@ class PostStates(StatesGroup):
     waiting_for_rename_title = State()
 
 
+class AuthStates(StatesGroup):
+    waiting_for_bot_token = State()
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_2fa = State()
+
+
 def is_admin(user_id: int) -> bool:
     admin_ids = config.get_admin_ids()
     if not admin_ids:
@@ -47,13 +99,26 @@ def is_admin(user_id: int) -> bool:
     return user_id in admin_ids
 
 
-def get_status_text() -> str:
+async def check_user_authorized() -> bool:
+    """Helper to check if Telegram client is authorized."""
+    try:
+        if not client.is_connected():
+            await init_telegram_client()
+        return client.is_connected() and await client.is_user_authorized()
+    except Exception:
+        return False
+
+
+async def get_status_text() -> str:
     settings = db.get_settings()
     is_running = settings.get("is_running", False)
     chats = db.get_all_chats()
     posts = db.get_all_posts()
     active_chats = sum(1 for c in chats if c.get("is_active"))
     error_chats = sum(1 for c in chats if c.get("status") in ["error", "restricted"])
+
+    is_auth = await check_user_authorized()
+    auth_str = "🟢 Підключено" if is_auth else "⚠️ Не авторизовано"
 
     status_emoji = "🟢 АКТИВНИЙ" if is_running else "⏸️ НА ПАУЗІ"
     pause_details = ""
@@ -64,6 +129,7 @@ def get_status_text() -> str:
 
     text = (
         f"🚀 <b>Панель керування автопостером</b>\n\n"
+        f"• Telegram Userbot: <b>{auth_str}</b>\n"
         f"• Статус розсилки: <b>{status_emoji}</b>\n"
         f"{pause_details}"
         f"• Всього чатів: <b>{len(chats)}</b> (активних: {active_chats})\n"
@@ -79,16 +145,40 @@ def get_status_text() -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("🚫 Доступ заборонено.")
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        await message.answer(
+            f"🚫 <b>Доступ заборонено.</b>\n\n"
+            f"Ваш Telegram User ID: <code>{user_id}</code>\n\n"
+            f"Щоб отримати доступ до керування цим ботом:\n"
+            f"1. Додайте ваш ID у файл <code>.env</code> (або в налаштуваннях Railway у вкладці Variables):\n"
+            f"<code>ADMIN_USER_IDS={user_id}</code>\n\n"
+            f"2. Перезапустіть бота та відправте /start знову.",
+            parse_mode="HTML"
+        )
         return
 
     await state.clear()
     settings = db.get_settings()
     is_running = settings.get("is_running", False)
+    is_auth = await check_user_authorized()
+    status_text = await get_status_text()
     await message.answer(
-        get_status_text(),
-        reply_markup=get_main_menu_keyboard(is_running),
+        status_text,
+        reply_markup=get_main_menu_keyboard(is_running, is_auth),
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("id", "myid"))
+async def cmd_myid(message: Message):
+    user_id = message.from_user.id
+    admin_status = "✅ Адміністратор" if is_admin(user_id) else "❌ Немає доступу"
+    await message.answer(
+        f"👤 <b>Ваш Telegram User ID:</b> <code>{user_id}</code>\n"
+        f"• Статус: <b>{admin_status}</b>\n\n"
+        f"Для надання доступу додайте цей ID у <code>ADMIN_USER_IDS</code>:\n"
+        f"<code>ADMIN_USER_IDS={user_id}</code>",
         parse_mode="HTML"
     )
 
@@ -102,16 +192,18 @@ async def cb_refresh(call: CallbackQuery, state: FSMContext):
     await state.clear()
     settings = db.get_settings()
     is_running = settings.get("is_running", False)
+    is_auth = await check_user_authorized()
+    status_text = await get_status_text()
     try:
         await call.message.edit_text(
-            get_status_text(),
-            reply_markup=get_main_menu_keyboard(is_running),
+            status_text,
+            reply_markup=get_main_menu_keyboard(is_running, is_auth),
             parse_mode="HTML"
         )
     except Exception:
         await call.message.answer(
-            get_status_text(),
-            reply_markup=get_main_menu_keyboard(is_running),
+            status_text,
+            reply_markup=get_main_menu_keyboard(is_running, is_auth),
             parse_mode="HTML"
         )
     await call.answer("Оновлено ✅")
@@ -875,3 +967,373 @@ async def cb_cancel_action(call: CallbackQuery):
         reply_markup=get_main_menu_keyboard(db.get_settings().get("is_running", False))
     )
     await call.answer()
+
+
+# ==================== TELEGRAM USERBOT AUTH HANDLERS ====================
+
+@router.callback_query(F.data == "btn_tg_auth")
+async def cb_telegram_auth(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await state.clear()
+    is_auth = False
+    me = None
+    try:
+        if not client.is_connected():
+            await init_telegram_client()
+        if client.is_connected() and await client.is_user_authorized():
+            is_auth = True
+            me = await client.get_me()
+    except Exception:
+        pass
+
+    if is_auth and me:
+        name = f"{me.first_name} {me.last_name or ''}".strip()
+        user_str = f"@{me.username}" if me.username else "без юзернейму"
+        phone_str = f"+{me.phone}" if me.phone else "не вказано"
+        premium_str = "⭐ Premium: Так" if getattr(me, "premium", False) else "⭐ Premium: Ні"
+        
+        text = (
+            f"👤 <b>Підключений акаунт Telegram (MTProto):</b>\n\n"
+            f"• Ім'я: <b>{escape(name)}</b>\n"
+            f"• Юзернейм: <b>{user_str}</b>\n"
+            f"• Телефон: <code>{phone_str}</code>\n"
+            f"• ID: <code>{me.id}</code>\n"
+            f"• {premium_str}\n"
+            f"• Статус сесії: 🟢 <b>Активна</b>\n"
+        )
+    else:
+        text = (
+            f"⚠️ <b>Telegram юзербот не авторизований!</b>\n\n"
+            f"Для автоматичної розсилки повідомлень у чати необхідно підключити акаунт Telegram.\n"
+            f"Ви можете авторизуватися прямо тут, у боті, за допомогою коду підтвердження."
+        )
+
+    await call.message.edit_text(
+        text,
+        reply_markup=get_auth_menu_keyboard(is_auth),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "auth_login_bot_token")
+async def cb_auth_login_bot_token(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await call.answer("⏳ Авторизація через Bot Token...")
+    res = await login_with_bot_token()
+    if res.get("status") == "ok":
+        me = await client.get_me()
+        await call.message.edit_text(
+            f"🎉 <b>Успішна авторизація через Bot Token!</b>\n\n"
+            f"• Бот: <b>@{me.username or me.id}</b>\n"
+            f"• Назва: <b>{escape(me.first_name)}</b>\n"
+            f"• ID: <code>{me.id}</code>\n"
+            f"• Статус сесії: 🟢 <b>Активна</b>\n\n"
+            f"Тепер сесія готова до роботи!",
+            reply_markup=get_auth_menu_keyboard(True),
+            parse_mode="HTML"
+        )
+    else:
+        await call.message.edit_text(
+            f"❌ <b>Помилка авторизації токена:</b>\n{escape(res.get('message', 'Невідома помилка'))}\n\n"
+            f"Перевірте змінну BOT_TOKEN у файлі .env",
+            reply_markup=get_auth_menu_keyboard(False),
+            parse_mode="HTML"
+        )
+
+
+@router.callback_query(F.data == "auth_input_bot_token")
+async def cb_auth_input_bot_token(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await state.set_state(AuthStates.waiting_for_bot_token)
+    text = (
+        "🤖 <b>Авторизація через Bot Token (BotFather)</b>\n\n"
+        "Надішліть сюди ключ вашого бота від @BotFather:\n"
+        "Наприклад: <code>8956589067:AAFkOaw8mtxi6o3xmOvhs2lBVukGZfY3-lg</code>\n\n"
+        "<i>Авторизація відбудеться миттєво без SMS та кодів.</i>"
+    )
+    await call.message.edit_text(text, reply_markup=get_cancel_auth_keyboard(), parse_mode="HTML")
+    await call.answer()
+
+
+@router.message(AuthStates.waiting_for_bot_token)
+async def process_auth_bot_token(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    token = message.text.strip()
+    if not token or ":" not in token:
+        await message.answer(
+            "⚠️ Введіть коректний токен бота (наприклад: <code>8956589067:AAFkOaw8mtxi6o3xmOvhs2lBVukGZfY3-lg</code>):",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    msg_wait = await message.answer("⏳ <i>Авторизація токена бота в Telegram...</i>", parse_mode="HTML")
+    res = await login_with_bot_token(token)
+    if res.get("status") == "ok":
+        await state.clear()
+        me = await client.get_me()
+        await msg_wait.delete()
+        await message.answer(
+            f"🎉 <b>Успішна авторизація через Bot Token!</b>\n\n"
+            f"• Бот: <b>@{me.username or me.id}</b>\n"
+            f"• Назва: <b>{escape(me.first_name)}</b>\n"
+            f"• ID: <code>{me.id}</code>\n"
+            f"• Статус сесії: 🟢 <b>Активна</b>\n\n"
+            f"Токен оновлено в системі. Тепер усе готово до розсилки!",
+            reply_markup=get_auth_menu_keyboard(True),
+            parse_mode="HTML"
+        )
+    else:
+        await msg_wait.edit_text(
+            f"❌ <b>Помилка авторизації токена:</b>\n{escape(res.get('message', 'Невідома помилка'))}\n\n"
+            f"Спробуйте надіслати токен ще раз:",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+
+
+@router.callback_query(F.data == "auth_start_phone")
+async def cb_auth_start_phone(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await state.set_state(AuthStates.waiting_for_phone)
+    text = (
+        "📱 <b>Авторизація в Telegram</b> (Крок 1/3)\n\n"
+        "Введіть ваш номер телефону у міжнародному форматі (з кодом країни).\n"
+        "Наприклад: <code>+380991234567</code>"
+    )
+    await call.message.edit_text(text, reply_markup=get_cancel_auth_keyboard(), parse_mode="HTML")
+    await call.answer()
+
+
+@router.message(AuthStates.waiting_for_phone)
+async def process_auth_phone(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    phone = normalize_phone(message.text)
+    if not phone or len(phone) < 8:
+        await message.answer(
+            "⚠️ Введіть коректний номер телефону (наприклад: <code>+380991234567</code> або <code>0991234567</code>):",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    msg_wait = await message.answer("⏳ <i>Надсилаємо запит коду в Telegram...</i>", parse_mode="HTML")
+
+    try:
+        if not client.is_connected():
+            await init_telegram_client()
+
+        sent = await client.send_code_request(phone)
+        target_desc = describe_sent_code_type(sent.type)
+        await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash)
+        await state.set_state(AuthStates.waiting_for_code)
+
+        await msg_wait.delete()
+        await message.answer(
+            f"📩 <b>Код підтвердження надіслано!</b> (Крок 2/3)\n\n"
+            f"📱 Номер: <code>{phone}</code>\n"
+            f"📍 <b>Куди надіслано:</b> {target_desc}\n\n"
+            f"⚠️ <b>УВАГА:</b> Код надходить <u>НЕ в SMS</u>, а в <b>офіційний додаток Telegram</b> (системний чат «Telegram» з синьою галочкою від сервісу 777000).\n\n"
+            f"Перевірте чати Telegram та введіть отриманий код (наприклад: <code>12345</code>):",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+    except PhoneNumberInvalidError:
+        await msg_wait.edit_text(
+            "❌ <b>Помилка:</b> Номер телефону вказано невірно. Перевірте формат і спробуйте знову:",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+    except FloodWaitError as e:
+        await msg_wait.edit_text(
+            f"⏳ <b>Забагато спроб!</b> Telegram просить зачекати {e.seconds} сек.",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error sending code in bot: {e}")
+        await msg_wait.edit_text(
+            f"❌ <b>Помилка:</b> {escape(str(e))}\n\nСпробуйте ввести номер ще раз:",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+
+
+@router.message(AuthStates.waiting_for_code)
+async def process_auth_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    code = message.text.strip().replace(" ", "").replace("-", "")
+    data = await state.get_data()
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+
+    msg_wait = await message.answer("⏳ <i>Перевіряємо код...</i>", parse_mode="HTML")
+
+    try:
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+    except SessionPasswordNeededError:
+        await state.set_state(AuthStates.waiting_for_2fa)
+        await msg_wait.delete()
+        await message.answer(
+            "🔐 <b>Двоетапна перевірка (2FA)</b> (Крок 3/3)\n\n"
+            "Для вашого акаунта увімкнено хмарний пароль.\n"
+            "Будь ласка, введіть ваш хмарний пароль 2FA:",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+    except PhoneCodeInvalidError:
+        await msg_wait.edit_text(
+            "❌ <b>Невірний код підтвердження!</b>\nПеревірте цифри та спробуйте ще раз:",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+    except PhoneCodeExpiredError:
+        await state.clear()
+        await msg_wait.edit_text(
+            "⚠️ <b>Час дії коду вичерпано.</b> Почніть авторизацію знову:",
+            reply_markup=get_auth_menu_keyboard(False),
+            parse_mode="HTML"
+        )
+        return
+    except Exception as e:
+        logger.error(f"Error verifying code in bot: {e}")
+        await msg_wait.edit_text(
+            f"❌ <b>Помилка авторизації:</b> {escape(str(e))}",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    await state.clear()
+    me = await client.get_me()
+    name = f"{me.first_name} {me.last_name or ''}".strip()
+    await msg_wait.delete()
+    await message.answer(
+        f"🎉 <b>Авторизація успішна!</b>\n\n"
+        f"Ви увійшли як: <b>{escape(name)}</b> (@{escape(me.username or 'без юзернейму')})\n"
+        f"🟢 Сесія активна та збережена. Автопостер готовий до роботи!",
+        reply_markup=get_main_menu_keyboard(db.get_settings().get("is_running", False), True),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AuthStates.waiting_for_2fa)
+async def process_auth_2fa(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    password = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    msg_wait = await message.answer("⏳ <i>Перевіряємо хмарний пароль...</i>", parse_mode="HTML")
+
+    try:
+        await client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        await msg_wait.edit_text(
+            "❌ <b>Невірний пароль 2FA!</b>\nПеревірте пароль та введіть знову:",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+    except Exception as e:
+        logger.error(f"Error 2FA in bot: {e}")
+        await msg_wait.edit_text(
+            f"❌ <b>Помилка 2FA авторизації:</b> {escape(str(e))}",
+            reply_markup=get_cancel_auth_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    await state.clear()
+    me = await client.get_me()
+    name = f"{me.first_name} {me.last_name or ''}".strip()
+    await msg_wait.delete()
+    await message.answer(
+        f"🎉 <b>Авторизація успішна!</b>\n\n"
+        f"Ви увійшли як: <b>{escape(name)}</b> (@{escape(me.username or 'без юзернейму')})\n"
+        f"🟢 Сесія активна та збережена. Автопостер готовий до роботи!",
+        reply_markup=get_main_menu_keyboard(db.get_settings().get("is_running", False), True),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "auth_logout")
+async def cb_auth_logout(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await state.clear()
+    await logout_client()
+    from bot.admin_bot import notify_admins
+    await notify_admins(
+        "🚪 <b>Сесію Telegram Userbot завершено!</b>\n\n"
+        "Користувач вийшов з акаунту через меню бота. Для розсилки потрібна нова авторизація."
+    )
+    await call.message.edit_text(
+        "🚪 <b>Ви успішно вийшли з Telegram акаунту.</b>\nПоточну сесію видалено.",
+        reply_markup=get_auth_menu_keyboard(False),
+        parse_mode="HTML"
+    )
+    await call.answer("Сесію завершено")
+
+
+@router.callback_query(F.data == "auth_reset_session")
+async def cb_auth_reset_session(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await state.clear()
+    await reset_client_session()
+    await call.message.edit_text(
+        "🔄 <b>Сесію скинуто!</b>\nФайл сесії очищено. Клієнт готовий до нової авторизації.",
+        reply_markup=get_auth_menu_keyboard(False),
+        parse_mode="HTML"
+    )
+    await call.answer("Сесію скинуто")
+
+
+@router.callback_query(F.data == "auth_cancel")
+async def cb_auth_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 Доступ заборонено.", show_alert=True)
+        return
+
+    await state.clear()
+    settings = db.get_settings()
+    is_running = settings.get("is_running", False)
+    is_auth = await check_user_authorized()
+    status_text = await get_status_text()
+
+    await call.message.edit_text(
+        status_text,
+        reply_markup=get_main_menu_keyboard(is_running, is_auth),
+        parse_mode="HTML"
+    )
+    await call.answer("Авторизацію скасовано")

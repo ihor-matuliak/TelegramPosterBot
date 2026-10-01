@@ -2,7 +2,7 @@ from typing import List, Dict, Any, Optional
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-def get_main_menu_keyboard(is_running: bool) -> InlineKeyboardMarkup:
+def get_main_menu_keyboard(is_running: bool, is_authorized: bool = True) -> InlineKeyboardMarkup:
     """Generate main admin menu keyboard."""
     toggle_text = "⏸️ Поставити на паузу" if is_running else "▶️ Запустити розсилку"
     toggle_cb = "btn_pause" if is_running else "btn_resume"
@@ -20,10 +20,38 @@ def get_main_menu_keyboard(is_running: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⭐ 📥 Завантажити зі «Збережених»", callback_data="btn_sync_saved")
         ],
         [
+            InlineKeyboardButton(
+                text="👤 Telegram Акаунт" if is_authorized else "🔑 Авторизуватись в Telegram",
+                callback_data="btn_tg_auth"
+            )
+        ],
+        [
             InlineKeyboardButton(text="🔄 Оновити меню", callback_data="btn_refresh")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def get_auth_menu_keyboard(is_authorized: bool) -> InlineKeyboardMarkup:
+    """Keyboard for Telegram Userbot account management and login."""
+    keyboard = []
+    if is_authorized:
+        keyboard.append([InlineKeyboardButton(text="🚪 Вийти з акаунту", callback_data="auth_logout")])
+        keyboard.append([InlineKeyboardButton(text="🔄 Скинути сесію", callback_data="auth_reset_session")])
+    else:
+        keyboard.append([InlineKeyboardButton(text="⚡ Вставити Bot Token від BotFather", callback_data="auth_input_bot_token")])
+        keyboard.append([InlineKeyboardButton(text="⚡ Увійти з Bot Token (.env)", callback_data="auth_login_bot_token")])
+        keyboard.append([InlineKeyboardButton(text="📱 Увійти за номером телефону", callback_data="auth_start_phone")])
+        keyboard.append([InlineKeyboardButton(text="🔄 Скинути сесію", callback_data="auth_reset_session")])
+    keyboard.append([InlineKeyboardButton(text="⬅️ Головне меню", callback_data="btn_refresh")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def get_cancel_auth_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard to cancel active authorization flow."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скасувати авторизацію", callback_data="auth_cancel")]
+    ])
 
 
 def get_posts_list_keyboard(posts: List[Dict[str, Any]]) -> InlineKeyboardMarkup:

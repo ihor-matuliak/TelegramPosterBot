@@ -19,6 +19,11 @@
                 </div>
                 <div class="tg-brand-subtitle" id="userSubtitle">Підключення...</div>
             </div>
+            <!-- Header Auth Action Button -->
+            <button id="headerAuthBtn" class="header-auth-btn unauth" title="Авторизація в Telegram">
+                <span id="headerAuthIcon">🔑</span>
+                <span id="headerAuthBtnText">Увійти</span>
+            </button>
         </div>
 
         <div class="header-controls">
@@ -62,6 +67,18 @@
 
         <!-- Main Content Area -->
         <main class="tg-content">
+
+            <!-- Global Authorization Warning Banner (hidden when authorized) -->
+            <div id="unauthAlertBanner" class="unauth-banner" style="display: none;">
+                <div class="unauth-banner-left">
+                    <span class="unauth-banner-icon">⚠️</span>
+                    <div class="unauth-banner-text">
+                        <div class="unauth-banner-title">Telegram акаунт не підключено!</div>
+                        <div class="unauth-banner-desc">Автоматична розсилка та пошук чатів призупинені. Підключіть акаунт через UI для роботи.</div>
+                    </div>
+                </div>
+                <button id="bannerAuthBtn" class="tg-btn tg-btn-primary tg-btn-sm">🔑 Підключити акаунт</button>
+            </div>
 
             <!-- TAB 1: CHATS -->
             <div id="tab-chats" class="tab-pane active">
@@ -265,6 +282,34 @@
             <div id="tab-settings" class="tab-pane">
                 <form id="settingsForm" style="display: flex; flex-direction: column; gap: 20px; max-width: 850px;">
                     
+                    <!-- 0. Telegram Account & Session -->
+                    <div class="tg-card">
+                        <div class="card-header">
+                            <div class="card-title">🔑 Telegram Акаунт (MTProto Userbot)</div>
+                            <span id="settingsAuthBadge" class="auth-status-badge unauth">Не авторизовано</span>
+                        </div>
+                        <div class="account-card-body">
+                            <div class="account-profile-snippet">
+                                <div class="account-avatar-sm" id="settingsAccAvatar">✈️</div>
+                                <div class="account-snippet-info">
+                                    <div class="account-snippet-name" id="settingsAccName">Акаунт не підключено</div>
+                                    <div class="account-snippet-sub" id="settingsAccPhone">Для публікації оголошень потрібна авторизація</div>
+                                </div>
+                            </div>
+                            <div class="account-card-actions">
+                                <button type="button" id="settingsLoginBtn" class="tg-btn tg-btn-primary tg-btn-sm">
+                                    🔑 Увійти в Telegram
+                                </button>
+                                <button type="button" id="settingsLogoutBtn" class="tg-btn tg-btn-danger tg-btn-sm" style="display: none;">
+                                    🚪 Вийти з акаунту
+                                </button>
+                                <button type="button" id="settingsResetBtn" class="tg-btn tg-btn-secondary tg-btn-sm" title="Видалити сесію і перепідключити клієнт">
+                                    🔄 Скинути сесію
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- 1. Delays & Jitter -->
                     <div class="tg-card">
                         <div class="card-header">
@@ -501,6 +546,147 @@
                     <button type="submit" class="tg-btn tg-btn-primary">Імпортувати всі</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- MODAL: TELEGRAM AUTHENTICATION -->
+    <div id="authModal" class="modal-overlay">
+        <div class="tg-modal auth-modal-box">
+            <div class="modal-header">
+                <div class="modal-header-icon">✈️</div>
+                <div class="modal-title" id="authModalTitle">Авторизація в Telegram</div>
+                <button type="button" class="modal-close-btn close-modal-btn">✕</button>
+            </div>
+
+            <div class="modal-body">
+                <!-- STEP 1: Phone input -->
+                <div id="authStep1" class="auth-step active">
+                    <div class="auth-bot-token-box" style="margin-bottom: 16px; padding: 14px; background: rgba(51, 144, 236, 0.08); border: 1px solid rgba(51, 144, 236, 0.3); border-radius: 8px;">
+                        <div style="font-weight: 600; margin-bottom: 6px; color: var(--tg-accent); display: flex; align-items: center; gap: 6px;">
+                            <span>⚡ Авторизація через Bot Token (BotFather)</span>
+                        </div>
+                        <div style="font-size: 13px; color: var(--tg-text-muted); margin-bottom: 10px;">
+                            Вставте токен бота (без SMS та коду). Якщо залишити порожнім — використається токен з файлу .env:
+                        </div>
+                        <div class="auth-input-group" style="margin-bottom: 10px;">
+                            <input type="text" id="authBotTokenInput" class="tg-input" placeholder="8956589067:AAFkOaw8mtxi6o3xmOvhs2lBVukGZfY3-lg" autocomplete="off" style="font-family: monospace; font-size: 13px;">
+                        </div>
+                        <button type="button" id="authLoginBotTokenBtn" class="tg-btn tg-btn-primary" style="width: 100%;">
+                            <span>⚡ Авторизуватись через Bot Token</span>
+                        </button>
+                    </div>
+                    <div style="display: flex; align-items: center; margin: 14px 0; color: var(--tg-text-muted); font-size: 12px;">
+                        <span style="flex: 1; height: 1px; background: var(--tg-border);"></span>
+                        <span style="padding: 0 10px; font-weight: 600;">АБО ЧЕРЕЗ АКАУНТ TELEGRAM</span>
+                        <span style="flex: 1; height: 1px; background: var(--tg-border);"></span>
+                    </div>
+                    <p class="auth-instruction">
+                        Введіть номер телефону Telegram у міжнародному форматі (з кодом країни):
+                    </p>
+                    <div class="auth-input-group">
+                        <label for="authPhoneInput">Номер телефону:</label>
+                        <input type="tel" id="authPhoneInput" class="tg-input" placeholder="+380991234567" autocomplete="tel">
+                    </div>
+                    <div id="authStep1Error" class="auth-error-msg" style="display: none;"></div>
+                    <div class="auth-hint">
+                        💡 Код підтвердження надійде у ваш офіційний додаток Telegram на телефоні чи комп'ютері.
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Скасувати</button>
+                        <button type="button" id="authSendCodeBtn" class="tg-btn tg-btn-primary">
+                            <span>Отримати код</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- STEP 2: Code input -->
+                <div id="authStep2" class="auth-step">
+                    <p class="auth-instruction">
+                        Введіть код підтвердження, надісланий на номер <strong id="authPhoneDisplay"></strong>:
+                    </p>
+                    <div id="authDeliveryNotice" class="auth-delivery-box" style="margin: 10px 0 14px 0; padding: 10px 12px; background: rgba(51, 144, 236, 0.12); border-left: 3px solid #3390ec; border-radius: 6px; font-size: 13px; line-height: 1.45; color: var(--tg-text);">
+                        📬 <strong>Де шукати код:</strong> Відкрийте Telegram на телефоні чи ПК та перевірте офіційний чат <strong>«Telegram»</strong> (з синьою галочкою від сервісу 777000). Код приходить туди, а <u>не в SMS</u>!
+                    </div>
+                    <div class="auth-input-group">
+                        <label for="authCodeInput">Код підтвердження:</label>
+                        <input type="text" id="authCodeInput" class="tg-input auth-code-input" placeholder="12345" maxlength="10" autocomplete="one-time-code">
+                    </div>
+                    <div id="authStep2Error" class="auth-error-msg" style="display: none;"></div>
+                    <div class="auth-sub-actions">
+                        <button type="button" id="authChangePhoneBtn" class="auth-text-link">← Змінити номер телефону</button>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Скасувати</button>
+                        <button type="button" id="authVerifyCodeBtn" class="tg-btn tg-btn-primary">
+                            <span>Підтвердити</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- STEP 3: 2FA Password -->
+                <div id="authStep3" class="auth-step">
+                    <p class="auth-instruction">
+                        Для цього акаунта увімкнено <strong>двоетапну перевірку (2FA)</strong>. Введіть ваш хмарний пароль:
+                    </p>
+                    <div class="auth-input-group">
+                        <label for="auth2faInput">Хмарний пароль (2FA):</label>
+                        <div class="password-wrapper">
+                            <input type="password" id="auth2faInput" class="tg-input" placeholder="Введіть пароль" autocomplete="current-password">
+                            <button type="button" id="toggle2faVisibilityBtn" class="pw-toggle-btn" title="Показати/приховати пароль">👁️</button>
+                        </div>
+                    </div>
+                    <div id="authStep3Error" class="auth-error-msg" style="display: none;"></div>
+                    <div class="modal-actions">
+                        <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Скасувати</button>
+                        <button type="button" id="authVerify2faBtn" class="tg-btn tg-btn-primary">
+                            <span>Увійти</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- STEP 4: Success -->
+                <div id="authStep4" class="auth-step">
+                    <div class="auth-success-box">
+                        <div class="auth-success-icon">✅</div>
+                        <div class="auth-success-title">Авторизація успішна!</div>
+                        <div id="authSuccessDetails" class="auth-success-details"></div>
+                    </div>
+                    <div class="modal-actions" style="justify-content: center;">
+                        <button type="button" id="authDoneBtn" class="tg-btn tg-btn-primary">Готово</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: ACCOUNT PROFILE / LOGOUT -->
+    <div id="accountModal" class="modal-overlay">
+        <div class="tg-modal auth-modal-box">
+            <div class="modal-header">
+                <div class="modal-header-icon">👤</div>
+                <div class="modal-title">Підключений акаунт Telegram</div>
+                <button type="button" class="modal-close-btn close-modal-btn">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="account-profile-card">
+                    <div class="account-avatar" id="accAvatar">✈️</div>
+                    <div class="account-info">
+                        <div class="account-name" id="accName">Завантаження...</div>
+                        <div class="account-username" id="accUsername">@...</div>
+                        <div class="account-meta">
+                            <span id="accPhone">...</span>
+                            <span id="accPremiumBadge" class="premium-star" style="display: none;">⭐ Premium</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="account-session-badge">
+                    <span class="status-dot green"></span> Сесія активна (MTProto)
+                </div>
+                <div class="modal-actions" style="justify-content: space-between; margin-top: 20px;">
+                    <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Закрити</button>
+                    <button type="button" id="accountLogoutBtn" class="tg-btn tg-btn-danger">🚪 Вийти з акаунту</button>
+                </div>
+            </div>
         </div>
     </div>
 
