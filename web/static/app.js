@@ -15,6 +15,8 @@ let isAuthorized = false;
 let currentUser = null;
 let currentAuthPhone = '';
 let currentPhoneCodeHash = '';
+let qrPollInterval = null;
+let currentAuthMethod = 'qr';
 
 document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
@@ -105,6 +107,28 @@ function initEventListeners() {
 
     const toggle2faBtn = document.getElementById('toggle2faVisibilityBtn');
     if (toggle2faBtn) toggle2faBtn.addEventListener('click', toggle2faVisibility);
+
+    // QR & Reauth Listeners
+    const tabBtnQr = document.getElementById('tabBtnQr');
+    if (tabBtnQr) tabBtnQr.addEventListener('click', () => switchAuthMethod('qr'));
+
+    const tabBtnPhone = document.getElementById('tabBtnPhone');
+    if (tabBtnPhone) tabBtnPhone.addEventListener('click', () => switchAuthMethod('phone'));
+
+    const refreshQrBtn = document.getElementById('refreshQrBtn');
+    if (refreshQrBtn) refreshQrBtn.addEventListener('click', () => startQrAuth());
+
+    const bannerReauthProfileBtn = document.getElementById('bannerReauthProfileBtn');
+    if (bannerReauthProfileBtn) bannerReauthProfileBtn.addEventListener('click', () => {
+        if (currentUser) {
+            openAccountModal(currentUser);
+        } else {
+            openAuthModal();
+        }
+    });
+
+    const reactivateAllChatsBtn = document.getElementById('reactivateAllChatsBtn');
+    if (reactivateAllChatsBtn) reactivateAllChatsBtn.addEventListener('click', handleReactivateAllChats);
 
     // Enter key shortcuts in auth inputs
     const botTokenInp = document.getElementById('authBotTokenInput');
@@ -203,35 +227,51 @@ async function fetchStatus() {
         const settingsLoginBtn = document.getElementById('settingsLoginBtn');
         const settingsLogoutBtn = document.getElementById('settingsLogoutBtn');
 
+        const botBadge = document.getElementById('botWarningBadge');
+        const botAlertBanner = document.getElementById('botAlertBanner');
+        const accBotWarning = document.getElementById('accBotWarning');
+
         isAuthorized = !!data.is_authorized;
         currentUser = data.user || null;
+        const isBot = !!(data.is_bot || (currentUser && currentUser.is_bot));
+
+        if (botBadge) botBadge.style.display = (isAuthorized && isBot) ? 'inline-block' : 'none';
+        if (botAlertBanner) botAlertBanner.style.display = (isAuthorized && isBot) ? 'flex' : 'none';
+        if (accBotWarning) accBotWarning.style.display = (isAuthorized && isBot) ? 'block' : 'none';
 
         if (isAuthorized && currentUser) {
-            userSubtitle.innerHTML = `👤 <span>${escapeHtml(currentUser.name)}</span> <span style="color: var(--accent-blue-hover)">(@${escapeHtml(currentUser.username || 'без юзернейму')})</span>`;
-            if (currentUser.is_premium) {
+            if (isBot) {
+                userSubtitle.innerHTML = `🤖 <span style="color: #f87171;">${escapeHtml(currentUser.name)}</span> <span style="color: #ef4444;">(@${escapeHtml(currentUser.username || 'бот')}) [БОТ - розсилка неможлива]</span>`;
+            } else {
+                userSubtitle.innerHTML = `👤 <span>${escapeHtml(currentUser.name)}</span> <span style="color: var(--accent-blue-hover)">(@${escapeHtml(currentUser.username || 'без юзернейму')})</span>`;
+            }
+
+            if (currentUser.is_premium && !isBot) {
                 premiumBadge.style.display = 'inline-block';
             } else {
                 premiumBadge.style.display = 'none';
             }
 
             if (headerAuthBtn) {
-                headerAuthBtn.className = 'header-auth-btn auth';
-                if (headerAuthIcon) headerAuthIcon.textContent = '👤';
-                if (headerAuthBtnText) headerAuthBtnText.textContent = currentUser.name || 'Акаунт';
-                headerAuthBtn.title = 'Керування акаунтом Telegram';
+                headerAuthBtn.className = isBot ? 'header-auth-btn unauth' : 'header-auth-btn auth';
+                if (headerAuthIcon) headerAuthIcon.textContent = isBot ? '🤖' : '👤';
+                if (headerAuthBtnText) headerAuthBtnText.textContent = currentUser.name || (isBot ? 'Бот' : 'Акаунт');
+                headerAuthBtn.title = isBot ? '⚠️ Авторизовано як бот! Натисніть для зміни' : 'Керування акаунтом Telegram';
             }
 
             if (unauthBanner) unauthBanner.style.display = 'none';
 
             if (settingsAuthBadge) {
-                settingsAuthBadge.className = 'auth-status-badge auth';
-                settingsAuthBadge.textContent = '🟢 Авторизовано';
+                settingsAuthBadge.className = isBot ? 'auth-status-badge unauth' : 'auth-status-badge auth';
+                settingsAuthBadge.textContent = isBot ? '⚠️ Авторизовано як БОТ' : '🟢 Авторизовано';
             }
-            if (settingsAccName) settingsAccName.textContent = currentUser.name;
+            if (settingsAccName) settingsAccName.textContent = currentUser.name + (isBot ? ' (БОТ)' : '');
             if (settingsAccPhone) {
                 const phoneStr = currentUser.phone ? `+${currentUser.phone}` : '';
                 const userStr = currentUser.username ? ` (@${currentUser.username})` : '';
-                settingsAccPhone.textContent = `${phoneStr}${userStr} • Сесія активна (MTProto)`;
+                settingsAccPhone.textContent = isBot
+                    ? `Токен бота • ⚠️ Не має права розсилати у звичайні групи`
+                    : `${phoneStr}${userStr} • Сесія активна (MTProto)`;
             }
             if (settingsLoginBtn) settingsLoginBtn.style.display = 'none';
             if (settingsLogoutBtn) settingsLogoutBtn.style.display = 'inline-block';
@@ -969,6 +1009,7 @@ function openModal(modalId) {
 }
 
 function closeModal() {
+    stopQrPolling();
     document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
 }
 
@@ -993,12 +1034,11 @@ function handleHeaderAuthClick() {
 }
 
 function openAuthModal() {
-    showAuthStep(1);
     clearAuthErrors();
     const phoneInput = document.getElementById('authPhoneInput');
-    phoneInput.value = currentAuthPhone || '+380';
+    if (phoneInput) phoneInput.value = currentAuthPhone || '+380';
+    switchAuthMethod('qr');
     openModal('authModal');
-    setTimeout(() => phoneInput.focus(), 150);
 }
 
 function openAccountModal(user) {
@@ -1010,26 +1050,38 @@ function openAccountModal(user) {
     if (premBadge) {
         premBadge.style.display = user.is_premium ? 'inline-block' : 'none';
     }
+    const accBotWarning = document.getElementById('accBotWarning');
+    if (accBotWarning) {
+        accBotWarning.style.display = user.is_bot ? 'block' : 'none';
+    }
     openModal('accountModal');
 }
 
 function showAuthStep(stepNumber) {
     clearAuthErrors();
-    [1, 2, 3, 4].forEach(s => {
+    const steps = ['Qr', '1', '2', '3', '4'];
+    steps.forEach(s => {
         const el = document.getElementById(`authStep${s}`);
-        if (el) el.classList.toggle('active', s === stepNumber);
+        if (el) el.classList.toggle('active', String(s).toLowerCase() === String(stepNumber).toLowerCase());
     });
 
-    if (stepNumber === 1) {
-        setTimeout(() => document.getElementById('authPhoneInput').focus(), 150);
-    } else if (stepNumber === 2) {
+    if (String(stepNumber) === '1') {
+        setTimeout(() => {
+            const inp = document.getElementById('authPhoneInput');
+            if (inp) inp.focus();
+        }, 150);
+    } else if (String(stepNumber) === '2') {
         const codeInput = document.getElementById('authCodeInput');
-        codeInput.value = '';
-        setTimeout(() => codeInput.focus(), 150);
-    } else if (stepNumber === 3) {
+        if (codeInput) {
+            codeInput.value = '';
+            setTimeout(() => codeInput.focus(), 150);
+        }
+    } else if (String(stepNumber) === '3') {
         const passInput = document.getElementById('auth2faInput');
-        passInput.value = '';
-        setTimeout(() => passInput.focus(), 150);
+        if (passInput) {
+            passInput.value = '';
+            setTimeout(() => passInput.focus(), 150);
+        }
     }
 }
 
@@ -1181,14 +1233,15 @@ async function handleAuthVerify2FA() {
     btn.innerHTML = '<span>⏳ Перевірка...</span>';
 
     try {
-        const res = await fetch('/api/auth/verify-2fa', {
+        const endpoint = currentAuthMethod === 'qr' ? '/api/auth/qr/2fa' : '/api/auth/verify-2fa';
+        const res = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ password })
         });
         const data = await res.json();
         if (!res.ok) {
-            throw new Error(data.detail || 'Невірний пароль 2FA');
+            throw new Error(data.detail || data.message || 'Невірний пароль 2FA');
         }
 
         if (data.status === 'ok') {
@@ -1203,12 +1256,20 @@ async function handleAuthVerify2FA() {
 }
 
 function handleAuthSuccess(user) {
+    stopQrPolling();
     const detailsEl = document.getElementById('authSuccessDetails');
     if (user && detailsEl) {
-        detailsEl.innerHTML = `
-            <div>Ви успішно увійшли як: <strong>${escapeHtml(user.name)}</strong> (@${escapeHtml(user.username || 'без юзернейму')})</div>
-            <div style="font-size: 13px; color: var(--accent-green); margin-top: 6px;">🟢 Сесія збережена і готова до роботи!</div>
-        `;
+        if (user.is_bot) {
+            detailsEl.innerHTML = `
+                <div>Авторизовано як <strong>БОТ</strong>: <strong>${escapeHtml(user.name)}</strong> (@${escapeHtml(user.username || 'бот')})</div>
+                <div style="font-size: 13px; color: #f87171; margin-top: 6px;">⚠️ УВАГА: Telegram боти не мають можливості розсилати у групи! Для розсилки потрібен реальний профіль.</div>
+            `;
+        } else {
+            detailsEl.innerHTML = `
+                <div>Ви успішно увійшли під профілем: <strong>${escapeHtml(user.name)}</strong> (@${escapeHtml(user.username || 'без юзернейму')})</div>
+                <div style="font-size: 13px; color: var(--accent-green); margin-top: 6px;">🟢 Профіль підключено (MTProto). Система готова до розсилки!</div>
+            `;
+        }
     }
     showAuthStep(4);
     fetchStatus();
@@ -1257,3 +1318,139 @@ async function handleResetSession() {
         alert('Помилка скидання сесії: ' + err);
     }
 }
+
+// ==================== QR CODE AUTHENTICATION ====================
+
+function switchAuthMethod(method) {
+    currentAuthMethod = method;
+    const btnQr = document.getElementById('tabBtnQr');
+    const btnPhone = document.getElementById('tabBtnPhone');
+    const stepQr = document.getElementById('authStepQr');
+    const stepPhone = document.getElementById('authStep1');
+
+    clearAuthErrors();
+
+    if (method === 'qr') {
+        if (btnQr) { btnQr.className = 'tg-btn tg-btn-primary'; }
+        if (btnPhone) { btnPhone.className = 'tg-btn tg-btn-secondary'; }
+        if (stepQr) stepQr.classList.add('active');
+        if (stepPhone) stepPhone.classList.remove('active');
+        startQrAuth();
+    } else {
+        stopQrPolling();
+        if (btnQr) { btnQr.className = 'tg-btn tg-btn-secondary'; }
+        if (btnPhone) { btnPhone.className = 'tg-btn tg-btn-primary'; }
+        if (stepQr) stepQr.classList.remove('active');
+        if (stepPhone) stepPhone.classList.add('active');
+        setTimeout(() => {
+            const inp = document.getElementById('authPhoneInput');
+            if (inp) inp.focus();
+        }, 150);
+    }
+}
+
+async function startQrAuth() {
+    stopQrPolling();
+    const loadingText = document.getElementById('qrLoadingText');
+    const svgHolder = document.getElementById('qrSvgHolder');
+    const qrErrorMsg = document.getElementById('qrErrorMsg');
+
+    if (loadingText) {
+        loadingText.style.display = 'block';
+        loadingText.textContent = '⏳ Генерація QR-коду...';
+    }
+    if (svgHolder) {
+        svgHolder.style.display = 'none';
+        svgHolder.innerHTML = '';
+    }
+    if (qrErrorMsg) {
+        qrErrorMsg.style.display = 'none';
+        qrErrorMsg.textContent = '';
+    }
+
+    try {
+        const res = await fetch('/api/auth/qr/start', { method: 'POST' });
+        const data = await res.json();
+        if (data.status === 'error') {
+            throw new Error(data.error || 'Не вдалося створити QR-код');
+        }
+
+        if (data.svg && svgHolder) {
+            svgHolder.innerHTML = data.svg;
+            svgHolder.style.display = 'block';
+            if (loadingText) loadingText.style.display = 'none';
+        }
+
+        qrPollInterval = setInterval(checkQrStatus, 2500);
+    } catch (err) {
+        if (loadingText) loadingText.textContent = '❌ Помилка створення QR';
+        if (qrErrorMsg) {
+            qrErrorMsg.textContent = err.message || 'Помилка генерації QR-коду';
+            qrErrorMsg.style.display = 'block';
+        }
+    }
+}
+
+function stopQrPolling() {
+    if (qrPollInterval) {
+        clearInterval(qrPollInterval);
+        qrPollInterval = null;
+    }
+}
+
+async function checkQrStatus() {
+    try {
+        const res = await fetch('/api/auth/qr/status');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (data.status === 'success' && data.user) {
+            stopQrPolling();
+            handleAuthSuccess(data.user);
+        } else if (data.status === 'needs_2fa') {
+            stopQrPolling();
+            showAuthStep(3);
+        } else if (data.status === 'expired') {
+            stopQrPolling();
+            const qrErrorMsg = document.getElementById('qrErrorMsg');
+            if (qrErrorMsg) {
+                qrErrorMsg.textContent = '⚠️ Термін дії QR-коду вичерпано. Натисніть «Оновити QR-код».';
+                qrErrorMsg.style.display = 'block';
+            }
+        } else if (data.status === 'error') {
+            stopQrPolling();
+            const qrErrorMsg = document.getElementById('qrErrorMsg');
+            if (qrErrorMsg) {
+                qrErrorMsg.textContent = data.error || 'Помилка перевірки QR-коду';
+                qrErrorMsg.style.display = 'block';
+            }
+        }
+    } catch (e) {
+        console.warn('QR status check error:', e);
+    }
+}
+
+// ==================== REACTIVATE ALL CHATS ====================
+
+async function handleReactivateAllChats() {
+    const btn = document.getElementById('reactivateAllChatsBtn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Відновлення...';
+    }
+    try {
+        const res = await fetch('/api/chats/reactivate-all', { method: 'POST' });
+        const data = await res.json();
+        alert(data.message || 'Чати успішно відновлено!');
+        await fetchChats();
+        await fetchStatus();
+    } catch (e) {
+        alert('Помилка відновлення чатів: ' + e.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '🔄 Відновити всі чати';
+        }
+    }
+}
+

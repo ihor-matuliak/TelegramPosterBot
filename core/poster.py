@@ -38,10 +38,12 @@ class PosterWorker:
         self._wait_reason: str | None = None
         self._wait_until: datetime | None = None
         self._circuit_reason: str | None = None
+        self._is_bot_account: bool = False
 
     def reset_errors(self) -> None:
         self._consecutive_errors = 0
         self._circuit_reason = None
+        self._is_bot_account = False
 
     def get_status(self, settings: dict, authorized: bool, hourly: int, daily: int) -> dict:
         """Report the local worker's actual blockers separately from the master switch."""
@@ -55,6 +57,8 @@ class PosterWorker:
             return {"state": "stopped", "reason": "Планувальник не запущений", "until": None}
         if not authorized:
             return {"state": "unauthorized", "reason": "Немає підключення або авторизації Telegram", "until": None}
+        if self._is_bot_account:
+            return {"state": "bot_error", "reason": "⚠️ Авторизовано через Бота, а не через Профіль! Telegram забороняє ботам писати у звичайні групи. Будь ласка, увійдіть через реальний профіль користувача.", "until": None}
         if self._wait_until and self._wait_until > datetime.now(timezone.utc):
             return {"state": "waiting", "reason": self._wait_reason, "until": self._wait_until.isoformat()}
         if self._is_night_time(settings):
@@ -134,6 +138,22 @@ class PosterWorker:
                     logger.warning("Poster idle: Telegram user is not connected or not authorized.")
                     await asyncio.sleep(15)
                     continue
+
+                # 3.1 Check if account is a bot
+                try:
+                    me = await client.get_me()
+                    if getattr(me, "bot", False):
+                        self._is_bot_account = True
+                        logger.error(
+                            "❌ КРИТИЧНО: Клієнт авторизований як БОТ (@%s). Боти не мають змоги розсилати у звичайні групи! Розсилку призупинено. Авторизуйтесь під профілем.",
+                            getattr(me, "username", me.id)
+                        )
+                        await self._wait(60, "Авторизовано через Бота — потрібен вхід під профілем")
+                        continue
+                    else:
+                        self._is_bot_account = False
+                except Exception as me_err:
+                    logger.warning(f"Error checking bot status in poster: {me_err}")
 
                 # 4. Hourly & Daily Rate Limit Safety Checks
                 max_hourly = settings.get("max_posts_per_hour", 15)

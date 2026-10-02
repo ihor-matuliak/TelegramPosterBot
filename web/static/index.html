@@ -16,6 +16,7 @@
                 <div class="tg-brand-title">
                     <span>Telegram Auto-Poster</span>
                     <span id="premiumBadge" class="premium-star" style="display: none;" title="Telegram Premium активний">⭐ Premium</span>
+                    <span id="botWarningBadge" class="tg-badge" style="display: none; background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-left: 6px;">⚠️ БОТ</span>
                 </div>
                 <div class="tg-brand-subtitle" id="userSubtitle">Підключення...</div>
             </div>
@@ -68,6 +69,18 @@
         <!-- Main Content Area -->
         <main class="tg-content">
 
+            <!-- Global Bot Warning Banner (shown when authorized as a BOT) -->
+            <div id="botAlertBanner" class="unauth-banner" style="display: none; background: rgba(239, 68, 68, 0.12); border-left-color: #ef4444;">
+                <div class="unauth-banner-left">
+                    <span class="unauth-banner-icon">🚨</span>
+                    <div class="unauth-banner-text">
+                        <div class="unauth-banner-title" style="color: #ef4444;">Увага: Авторизовано як БОТ, а не як Профіль!</div>
+                        <div class="unauth-banner-desc">Telegram боти не мають права писати у звичайні групи. Розсилку призупинено. Будь ласка, залогіньтесь під реальним профілем користувача через QR-код або телефон.</div>
+                    </div>
+                </div>
+                <button id="bannerReauthProfileBtn" class="tg-btn tg-btn-danger tg-btn-sm">🔄 Увійти під профілем</button>
+            </div>
+
             <!-- Global Authorization Warning Banner (hidden when authorized) -->
             <div id="unauthAlertBanner" class="unauth-banner" style="display: none;">
                 <div class="unauth-banner-left">
@@ -102,7 +115,8 @@
                 <div class="tg-card">
                     <div class="card-header">
                         <div class="card-title">Список підключених чатів для розсилки</div>
-                        <div style="display: flex; gap: 10px;">
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <button id="reactivateAllChatsBtn" class="tg-btn tg-btn-secondary" title="Відновити всі чати зі статусу помилок/обмежень у статус активних">🔄 Відновити всі чати</button>
                             <button id="openBatchModalBtn" class="tg-btn tg-btn-secondary">📋 Імпорт списком</button>
                             <button id="openAddChatModalBtn" class="tg-btn tg-btn-primary">+ Додати чат</button>
                         </div>
@@ -558,28 +572,39 @@
                 <button type="button" class="modal-close-btn close-modal-btn">✕</button>
             </div>
 
+            <!-- Modal Tabs: QR Code (default) vs Phone Number -->
+            <div class="auth-method-tabs" style="display: flex; gap: 8px; margin: 0 20px 14px 20px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 10px;">
+                <button type="button" id="tabBtnQr" class="tg-btn tg-btn-primary" style="flex: 1; padding: 10px 12px; font-size: 13px;">
+                    📷 QR-код (Швидкий вхід)
+                </button>
+                <button type="button" id="tabBtnPhone" class="tg-btn tg-btn-secondary" style="flex: 1; padding: 10px 12px; font-size: 13px;">
+                    📱 Номер телефону
+                </button>
+            </div>
+
             <div class="modal-body">
+                <!-- STEP QR: Telegram QR Code Scan -->
+                <div id="authStepQr" class="auth-step active" style="text-align: center;">
+                    <p class="auth-instruction" style="margin-bottom: 14px;">
+                        Вхід під вашим реальним профілем через офіційний додаток Telegram:
+                    </p>
+                    <div id="qrCodeContainer" style="background: white; padding: 16px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 16px rgba(0,0,0,0.3); min-width: 200px; min-height: 200px; margin-bottom: 14px;">
+                        <div id="qrLoadingText" style="color: #666; font-size: 13px; padding: 75px 15px;">⏳ Генерація QR-коду...</div>
+                        <div id="qrSvgHolder" style="display: none; line-height: 0;"></div>
+                    </div>
+                    <div id="qrInstructionsBox" style="font-size: 13px; line-height: 1.5; color: var(--text-primary); background: rgba(51, 144, 236, 0.08); padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; border: 1px solid rgba(51, 144, 236, 0.2);">
+                        1. Відкрийте Telegram на смартфоні → <strong>Налаштування</strong> → <strong>Пристрої</strong><br>
+                        2. Натисніть <strong>«Підключити пристрій»</strong> та наведіть камеру на цей QR-код
+                    </div>
+                    <div id="qrErrorMsg" class="auth-error-msg" style="display: none; margin-bottom: 12px;"></div>
+                    <div class="modal-actions" style="justify-content: center; gap: 10px;">
+                        <button type="button" id="refreshQrBtn" class="tg-btn tg-btn-secondary">🔄 Оновити QR-код</button>
+                        <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Скасувати</button>
+                    </div>
+                </div>
+
                 <!-- STEP 1: Phone input -->
-                <div id="authStep1" class="auth-step active">
-                    <div class="auth-bot-token-box" style="margin-bottom: 16px; padding: 14px; background: rgba(51, 144, 236, 0.08); border: 1px solid rgba(51, 144, 236, 0.3); border-radius: 8px;">
-                        <div style="font-weight: 600; margin-bottom: 6px; color: var(--tg-accent); display: flex; align-items: center; gap: 6px;">
-                            <span>⚡ Авторизація через Bot Token (BotFather)</span>
-                        </div>
-                        <div style="font-size: 13px; color: var(--tg-text-muted); margin-bottom: 10px;">
-                            Вставте токен бота (без SMS та коду). Якщо залишити порожнім — використається токен з файлу .env:
-                        </div>
-                        <div class="auth-input-group" style="margin-bottom: 10px;">
-                            <input type="text" id="authBotTokenInput" class="tg-input" placeholder="8956589067:AAFkOaw8mtxi6o3xmOvhs2lBVukGZfY3-lg" autocomplete="off" style="font-family: monospace; font-size: 13px;">
-                        </div>
-                        <button type="button" id="authLoginBotTokenBtn" class="tg-btn tg-btn-primary" style="width: 100%;">
-                            <span>⚡ Авторизуватись через Bot Token</span>
-                        </button>
-                    </div>
-                    <div style="display: flex; align-items: center; margin: 14px 0; color: var(--tg-text-muted); font-size: 12px;">
-                        <span style="flex: 1; height: 1px; background: var(--tg-border);"></span>
-                        <span style="padding: 0 10px; font-weight: 600;">АБО ЧЕРЕЗ АКАУНТ TELEGRAM</span>
-                        <span style="flex: 1; height: 1px; background: var(--tg-border);"></span>
-                    </div>
+                <div id="authStep1" class="auth-step">
                     <p class="auth-instruction">
                         Введіть номер телефону Telegram у міжнародному форматі (з кодом країни):
                     </p>
@@ -597,6 +622,22 @@
                             <span>Отримати код</span>
                         </button>
                     </div>
+
+                    <!-- Collapsed bot token with explicit warning -->
+                    <details style="margin-top: 18px; padding: 10px 12px; border-radius: 8px; background: rgba(255,255,255,0.02); font-size: 12px; border: 1px dashed rgba(255,255,255,0.12);">
+                        <summary style="cursor: pointer; color: var(--tg-text-muted); font-weight: 500;">
+                            🛠️ Додатково: Авторизація через Bot Token (BotFather)
+                        </summary>
+                        <div style="margin-top: 10px;">
+                            <div style="color: #f87171; font-size: 12px; margin-bottom: 8px; line-height: 1.4;">
+                                ⚠️ <strong>Увага:</strong> Telegram боти не можуть самостійно писати у звичайні групи. Розсилка працює лише під реальним профілем!
+                            </div>
+                            <input type="text" id="authBotTokenInput" class="tg-input" placeholder="8956589067:AAFkOaw8mtxi6o3xmOvhs2lBVukGZfY3-lg" autocomplete="off" style="font-family: monospace; font-size: 12px; margin-bottom: 8px;">
+                            <button type="button" id="authLoginBotTokenBtn" class="tg-btn tg-btn-secondary tg-btn-sm" style="width: 100%;">
+                                <span>⚡ Авторизувати Bot Token</span>
+                            </button>
+                        </div>
+                    </details>
                 </div>
 
                 <!-- STEP 2: Code input -->
@@ -681,6 +722,9 @@
                 </div>
                 <div class="account-session-badge">
                     <span class="status-dot green"></span> Сесія активна (MTProto)
+                </div>
+                <div id="accBotWarning" style="display: none; margin-top: 12px; padding: 12px; border-radius: 8px; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; font-size: 13px; line-height: 1.45;">
+                    🚨 <strong>Увага:</strong> Цей акаунт авторизований як <strong>БОТ</strong>. Telegram боти не мають права писати у звичайні групи! Будь ласка, натисніть <strong>«Вийти з акаунту»</strong> та авторизуйтесь під вашим реальним профілем через QR-код або телефон.
                 </div>
                 <div class="modal-actions" style="justify-content: space-between; margin-top: 20px;">
                     <button type="button" class="tg-btn tg-btn-secondary close-modal-btn">Закрити</button>

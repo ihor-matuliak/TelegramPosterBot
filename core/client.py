@@ -7,7 +7,9 @@ from telethon.errors import (
     SlowModeWaitError,
     AuthKeyDuplicatedError,
     AuthKeyUnregisteredError,
-    SessionRevokedError
+    SessionRevokedError,
+    SessionPasswordNeededError,
+    PasswordHashInvalidError
 )
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
@@ -21,23 +23,37 @@ from config import config, BASE_DIR
 logger = logging.getLogger("TelegramClient")
 
 
-def _create_raw_client() -> TelegramClient:
+def _create_raw_client(loop=None) -> TelegramClient:
     string_session = os.getenv("TELEGRAM_STRING_SESSION", "").strip().strip('"').strip("'")
-    session_target = StringSession(string_session) if string_session else str(BASE_DIR / config.TELEGRAM_SESSION_NAME)
+    session_name = (config.TELEGRAM_SESSION_NAME or "poster_session").strip().strip('"').strip("'")
+
+    # If TELEGRAM_SESSION_NAME was mistakenly filled with a StringSession
+    if not string_session and len(session_name) > 60 and session_name.startswith("1"):
+        string_session = session_name
+
+    if string_session:
+        session_target = StringSession(string_session)
+    else:
+        safe_name = "poster_session" if len(session_name) > 50 else session_name
+        session_target = str(BASE_DIR / safe_name)
+
     safe_api_id = config.TELEGRAM_API_ID if config.TELEGRAM_API_ID else 1
     safe_api_hash = config.TELEGRAM_API_HASH if config.TELEGRAM_API_HASH else "00000000000000000000000000000000"
 
-    return TelegramClient(
-        session_target,
-        api_id=safe_api_id,
-        api_hash=safe_api_hash,
-        device_model="Desktop",
-        system_version="Windows 10",
-        app_version="4.16.8 x64",
-        lang_code="en",
-        system_lang_code="en",
-        flood_sleep_threshold=0
-    )
+    kwargs = {
+        "api_id": safe_api_id,
+        "api_hash": safe_api_hash,
+        "device_model": "Desktop",
+        "system_version": "Windows 10",
+        "app_version": "4.16.8 x64",
+        "lang_code": "en",
+        "system_lang_code": "en",
+        "flood_sleep_threshold": 0
+    }
+    if loop is not None:
+        kwargs["loop"] = loop
+
+    return TelegramClient(session_target, **kwargs)
 
 
 def normalize_phone(raw: str) -> str:
@@ -194,8 +210,18 @@ async def reset_client_session(delete_files: bool = True) -> bool:
             except Exception:
                 pass
 
-    new_raw = _create_raw_client()
+    cur_loop = None
+    try:
+        cur_loop = asyncio.get_running_loop()
+    except Exception:
+        pass
+    new_raw = _create_raw_client(loop=cur_loop)
     client.set_target(new_raw)
+    try:
+        if "qr_auth" in globals():
+            qr_auth.reset()
+    except Exception:
+        pass
     try:
         await client.connect()
         logger.info("Новий клієнт Telegram успішно підключено та готовий до авторизації.")
@@ -293,6 +319,16 @@ async def init_telegram_client() -> TelegramClient:
         return client
 
     try:
+        cur_loop = asyncio.get_running_loop()
+        target = client.get_target() if hasattr(client, "get_target") else None
+        if target and hasattr(target, "loop") and target.loop != cur_loop:
+            logger.info("Event loop changed, recreating TelegramClient on current running loop...")
+            new_target = _create_raw_client(loop=cur_loop)
+            client.set_target(new_target)
+    except Exception:
+        pass
+
+    try:
         if not client.is_connected():
             logger.info("Connecting to Telegram MTProto...")
             await client.connect()
@@ -376,3 +412,141 @@ async def simulate_typing(peer, duration_seconds: int = 4):
         raise
     except Exception:
         pass
+
+
+class QRAuthManager:
+    """Manages Telegram QR Code authentication workflow for logging in as a user profile."""
+    def __init__(self):
+        self._qr_login = None
+        self._task: asyncio.Task | None = None
+        self._status: str = "idle"  # idle, waiting, needs_2fa, success, error, expired
+        self._user_info: dict | None = None
+        self._error_msg: str | None = None
+        self._url: str | None = None
+        self._svg: str | None = None
+        self._expires: str | None = None
+
+    def get_state(self) -> dict:
+        return {
+            "status": self._status,
+            "url": self._url,
+            "svg": self._svg,
+            "expires": self._expires,
+            "user": self._user_info,
+            "error": self._error_msg
+        }
+
+    async def start(self) -> dict:
+        """Start or refresh a Telegram QR code login session."""
+        self._cancel_task()
+        self._status = "waiting"
+        self._user_info = None
+        self._error_msg = None
+
+        if not client.is_connected():
+            await init_telegram_client()
+
+        try:
+            self._qr_login = await client.qr_login()
+            self._url = self._qr_login.url
+            self._expires = self._qr_login.expires.isoformat() if getattr(self._qr_login, "expires", None) else None
+            self._svg = self._render_svg(self._url)
+            self._task = asyncio.create_task(self._wait_loop())
+            return self.get_state()
+        except Exception as e:
+            logger.error(f"Error starting QR login: {e}")
+            self._status = "error"
+            self._error_msg = str(e)
+            return self.get_state()
+
+    def _render_svg(self, url: str) -> str:
+        try:
+            import qrcode
+            import qrcode.image.svg
+            import io
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=8,
+                border=2,
+                image_factory=qrcode.image.svg.SvgPathImage
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image()
+            buf = io.BytesIO()
+            img.save(buf)
+            return buf.getvalue().decode("utf-8")
+        except Exception as e:
+            logger.warning(f"Could not render SVG QR code: {e}")
+            return ""
+
+    async def _wait_loop(self):
+        try:
+            await self._qr_login.wait(timeout=120)
+            me = await client.get_me()
+            self._status = "success"
+            self._user_info = {
+                "id": me.id,
+                "name": f"{me.first_name} {me.last_name or ''}".strip(),
+                "username": me.username,
+                "phone": me.phone,
+                "is_bot": getattr(me, "bot", False),
+                "is_premium": getattr(me, "premium", False)
+            }
+            logger.info(f"QR Login successful as user: {self._user_info['name']} (@{self._user_info['username']})")
+        except SessionPasswordNeededError:
+            self._status = "needs_2fa"
+            self._error_msg = "Для вашого акаунта активовано двоетапну перевірку (2FA). Введіть хмарний пароль."
+            logger.info("QR Login requires 2FA cloud password.")
+        except (asyncio.TimeoutError, Exception) as e:
+            if isinstance(e, asyncio.CancelledError):
+                return
+            err_name = type(e).__name__
+            if "Timeout" in err_name or "expired" in str(e).lower():
+                self._status = "expired"
+                self._error_msg = "Термін дії QR-коду вичерпано. Натисніть «Оновити QR-код»."
+            else:
+                self._status = "error"
+                self._error_msg = str(e)
+                logger.error(f"Error during QR login wait: {e}")
+
+    async def submit_2fa(self, password: str) -> dict:
+        if self._status != "needs_2fa":
+            return {"status": "error", "message": "2FA не очікується"}
+        try:
+            await client.sign_in(password=password.strip())
+            me = await client.get_me()
+            self._status = "success"
+            self._user_info = {
+                "id": me.id,
+                "name": f"{me.first_name} {me.last_name or ''}".strip(),
+                "username": me.username,
+                "phone": me.phone,
+                "is_bot": getattr(me, "bot", False),
+                "is_premium": getattr(me, "premium", False)
+            }
+            return {"status": "ok", "user": self._user_info}
+        except PasswordHashInvalidError:
+            return {"status": "error", "message": "Невірний хмарний пароль 2FA! Перевірте пароль і спробуйте знову."}
+        except Exception as e:
+            return {"status": "error", "message": f"Помилка 2FA авторизації: {e}"}
+
+    def _cancel_task(self):
+        if self._task and not self._task.done():
+            self._task.cancel()
+            self._task = None
+
+    def reset(self):
+        self._cancel_task()
+        self._qr_login = None
+        self._status = "idle"
+        self._user_info = None
+        self._error_msg = None
+        self._url = None
+        self._svg = None
+        self._expires = None
+
+
+qr_auth = QRAuthManager()
+

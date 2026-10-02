@@ -25,7 +25,8 @@ from core.client import (
     reset_client_session,
     logout_client,
     login_with_bot_token,
-    get_latest_saved_message
+    get_latest_saved_message,
+    qr_auth
 )
 
 try:
@@ -184,11 +185,13 @@ async def get_system_status():
         if client.is_connected() and await client.is_user_authorized():
             is_authorized = True
             me = await client.get_me()
+            is_bot = getattr(me, "bot", False)
             user_info = {
                 "id": me.id,
                 "name": f"{me.first_name} {me.last_name or ''}".strip(),
                 "username": me.username,
                 "phone": me.phone,
+                "is_bot": is_bot,
                 "is_premium": getattr(me, "premium", False)
             }
     except Exception as e:
@@ -201,8 +204,11 @@ async def get_system_status():
     hourly_count = db.get_hourly_post_count()
     daily_count = db.get_daily_post_count()
 
+    is_bot_account = user_info.get("is_bot", False) if user_info else False
+
     return {
         "is_authorized": is_authorized,
+        "is_bot": is_bot_account,
         "user": user_info,
         "is_running": settings.get("is_running", False),
         "poster": poster_worker.get_status(settings, is_authorized, hourly_count, daily_count),
@@ -289,6 +295,17 @@ async def update_chat(chat_id: str, req: ChatUpdateRequest):
 async def delete_chat(chat_id: str):
     success = db.delete_chat(chat_id)
     return {"status": "ok" if success else "error"}
+
+
+@web_app.post("/api/chats/reactivate-all")
+async def reactivate_all_chats():
+    """Reset all chats from error/restricted states back to active."""
+    count = db.reactivate_all_chats()
+    return {
+        "status": "ok",
+        "message": f"Відновлено {count} чатів з помилок/обмежень у статус активних.",
+        "reactivated_count": count
+    }
 
 
 @web_app.get("/api/posts")
@@ -603,11 +620,40 @@ async def handle_reset_session():
 @web_app.post("/api/auth/login-bot-token")
 async def handle_login_bot_token(req: Optional[BotTokenAuthRequest] = None):
     """
-    Log in immediately using a Telegram Bot Token (from BotFather).
+    Log in using a Telegram Bot Token (from BotFather).
     Does NOT require a phone number or SMS/Telegram verification code.
+    WARNING: Telegram bots cannot post ads into groups!
     """
     token = req.bot_token if req and req.bot_token else None
     res = await login_with_bot_token(token)
     if res.get("status") != "ok":
         raise HTTPException(status_code=400, detail=res.get("message", "Помилка авторизації бота"))
     return res
+
+
+# ==================== TELEGRAM QR CODE AUTHENTICATION ====================
+
+class QR2FARequest(BaseModel):
+    password: str
+
+
+@web_app.post("/api/auth/qr/start")
+async def handle_qr_start():
+    """Start or refresh a Telegram QR code login session."""
+    return await qr_auth.start()
+
+
+@web_app.get("/api/auth/qr/status")
+async def handle_qr_status():
+    """Check the real-time status of the QR login session."""
+    return qr_auth.get_state()
+
+
+@web_app.post("/api/auth/qr/2fa")
+async def handle_qr_2fa(req: QR2FARequest):
+    """Submit 2FA cloud password if requested during QR login."""
+    res = await qr_auth.submit_2fa(req.password)
+    if res.get("status") != "ok":
+        raise HTTPException(status_code=400, detail=res.get("message", "Помилка 2FA авторизації"))
+    return res
+

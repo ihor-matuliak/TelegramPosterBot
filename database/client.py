@@ -219,6 +219,30 @@ class SupabaseDB:
             "last_error": error_msg
         })
 
+    def reactivate_all_chats(self) -> int:
+        """Reset all restricted and error chats back to active status."""
+        if not self.client:
+            return 0
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            res = (
+                self.client.table("chats")
+                .update({
+                    "is_active": True,
+                    "status": "active",
+                    "last_error": None,
+                    "updated_at": now_iso
+                })
+                .neq("chat_peer", "")
+                .execute()
+            )
+            count = len(res.data) if res.data else 0
+            logger.info(f"Reactivated {count} chats back to active.")
+            return count
+        except Exception as e:
+            logger.error(f"Error reactivating chats: {e}")
+            return 0
+
     # ==================== POSTS / TEMPLATES ====================
 
     def get_active_post(self) -> Optional[Dict[str, Any]]:
