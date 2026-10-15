@@ -40,6 +40,10 @@ class Config:
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
     SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "").strip().strip('"').strip("'")
 
+    # Additional posting accounts. Set to false on a local copy that shares the production
+    # database, otherwise both processes connect the same sessions (AuthKeyDuplicated).
+    ACCOUNT_WORKERS_ENABLED: bool = os.getenv("ACCOUNT_WORKERS_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
     # Web Dashboard
     WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")
     WEB_PORT: int = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8000")

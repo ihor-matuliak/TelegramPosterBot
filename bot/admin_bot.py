@@ -2,6 +2,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from config import config
 from bot.handlers import router
+from bot.accounts_handlers import router as accounts_router
 
 logger = logging.getLogger("AdminBot")
 
@@ -35,6 +36,8 @@ async def run_admin_bot():
 
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher()
+    # Before the main router: its catch-all text handler would swallow account FSM input.
+    dp.include_router(accounts_router)
     dp.include_router(router)
 
     logger.info("Telegram Admin Bot started polling.")

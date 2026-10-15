@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -13,8 +14,25 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHAT_POSTS_FILE = DATA_DIR / "chat_posts.json"
 
+# Account scope key of the original (env/session-file) account. Its chats and logs have account_id = NULL.
+PRIMARY_ACCOUNT = "primary"
+ACCOUNT_PUBLIC_FIELDS = (
+    "id,label,telegram_user_id,first_name,username,phone,is_premium,"
+    "posting_enabled,status,last_error,created_at,updated_at"
+)
+ACCOUNTS_MIGRATION = "database/migrations/20261015_multi_accounts.sql"
+
+
+class ChatConflictError(Exception):
+    """The chat already belongs to another account's list."""
+
 
 class SupabaseDB:
+    # Class-level defaults keep instances created without __init__ (tests) usable.
+    _accounts_ready: bool = False
+    _accounts_checked_at: float = float("-inf")
+    _accounts_warned: bool = False
+
     def __init__(self):
         self.client: Optional[Client] = None
         self._init_client()
@@ -55,34 +73,79 @@ class SupabaseDB:
                 c["post_id"] = local_map[c["id"]]
         return chats
 
+    # ==================== MULTI-ACCOUNT SCOPE ====================
+
+    def supports_accounts(self) -> bool:
+        """True once the multi-account migration is applied. Re-checked at most once a minute until then."""
+        if self._accounts_ready:
+            return True
+        if not self.client:
+            return False
+        now = time.monotonic()
+        if now - self._accounts_checked_at < 60:
+            return False
+        self._accounts_checked_at = now
+        try:
+            self.client.table("accounts").select("id").limit(1).execute()
+            self.client.table("chats").select("account_id").limit(1).execute()
+            self.client.table("logs").select("account_id").limit(1).execute()
+            self._accounts_ready = True
+            logger.info("Multi-account schema detected.")
+        except Exception as e:
+            log = logger.debug if self._accounts_warned else logger.warning
+            log(f"Multi-account schema is not available yet (apply {ACCOUNTS_MIGRATION}): {e}")
+            self._accounts_warned = True
+        return self._accounts_ready
+
+    @staticmethod
+    def _account_value(account: str) -> Optional[str]:
+        """Convert an account scope key into the stored chats/logs.account_id value."""
+        return None if account == PRIMARY_ACCOUNT else account
+
+    def _scoped(self, query, account: Optional[str]):
+        """Restrict a chats/logs query to one account (None = all accounts).
+
+        Returns None when the scope cannot be honoured, i.e. a secondary account
+        is requested before the migration exists. Callers must then return nothing.
+        """
+        if account is None:
+            return query
+        if not self.supports_accounts():
+            return query if account == PRIMARY_ACCOUNT else None
+        if account == PRIMARY_ACCOUNT:
+            return query.is_("account_id", "null")
+        return query.eq("account_id", account)
+
     # ==================== CHATS CRUD ====================
 
-    def get_all_chats(self) -> List[Dict[str, Any]]:
-        """Retrieve all registered target chats with post assignments."""
+    def get_all_chats(self, account: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve registered target chats with post assignments (all accounts unless scoped)."""
         if not self.client:
             return []
         try:
-            res = self.client.table("chats").select("*").order("created_at", desc=False).execute()
+            query = self._scoped(self.client.table("chats").select("*"), account)
+            if query is None:
+                return []
+            res = query.order("created_at", desc=False).execute()
             chats = res.data or []
             return self._merge_chat_post_ids(chats)
         except Exception as e:
             logger.error(f"Error fetching chats: {e}")
             return []
 
-    def get_due_chats(self) -> List[Dict[str, Any]]:
+    def get_due_chats(self, account: Optional[str] = None) -> List[Dict[str, Any]]:
         """Retrieve active chats that are ready for posting (next_post_at <= now)."""
         if not self.client:
             return []
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
-            res = (
-                self.client.table("chats")
-                .select("*")
-                .eq("is_active", True)
-                .lte("next_post_at", now_iso)
-                .order("next_post_at", desc=False)
-                .execute()
+            query = self._scoped(
+                self.client.table("chats").select("*").eq("is_active", True).lte("next_post_at", now_iso),
+                account,
             )
+            if query is None:
+                return []
+            res = query.order("next_post_at", desc=False).execute()
             chats = res.data or []
             return self._merge_chat_post_ids(chats)
         except Exception as e:
@@ -108,13 +171,21 @@ class SupabaseDB:
         chat_peer: str,
         interval_minutes: int = 60,
         title: str = "",
-        post_id: Optional[str] = None
+        post_id: Optional[str] = None,
+        account: str = PRIMARY_ACCOUNT
     ) -> Optional[Dict[str, Any]]:
-        """Add or update a target chat with optional specific post_id."""
+        """Add or update a target chat of one account with optional specific post_id.
+
+        Raises ChatConflictError when the chat already belongs to another account
+        and the database still allows a chat in only one list.
+        """
         if not self.client:
             return None
         chat_peer = chat_peer.strip()
         if not chat_peer:
+            return None
+        if account != PRIMARY_ACCOUNT and not self.supports_accounts():
+            logger.error(f"Cannot add chat {chat_peer} to account {account}: apply {ACCOUNTS_MIGRATION}")
             return None
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -129,7 +200,15 @@ class SupabaseDB:
             }
             if post_id:
                 data["post_id"] = post_id
-            
+
+            if self.supports_accounts():
+                chat_record = self._save_account_chat(data, account)
+                if chat_record and post_id:
+                    local_map = self._load_local_chat_posts()
+                    local_map[chat_record["id"]] = post_id
+                    self._save_local_chat_posts(local_map)
+                return chat_record
+
             chat_record = None
             try:
                 res = self.client.table("chats").upsert(data, on_conflict="chat_peer").execute()
@@ -149,9 +228,39 @@ class SupabaseDB:
                 chat_record["post_id"] = post_id
 
             return chat_record
+        except ChatConflictError:
+            raise
         except Exception as e:
             logger.error(f"Error adding chat {chat_peer}: {e}")
             return None
+
+    def _save_account_chat(self, data: Dict[str, Any], account: str) -> Optional[Dict[str, Any]]:
+        """Update the chat in this account's list or insert it, never moving it from another account.
+
+        Works both with the legacy UNIQUE(chat_peer) constraint and with the
+        optional per-account constraint from the phase 2 migration.
+        """
+        owner = self._account_value(account)
+        existing = (
+            self.client.table("chats").select("id,account_id").eq("chat_peer", data["chat_peer"]).execute().data
+            or []
+        )
+        own = next((row for row in existing if row.get("account_id") == owner), None)
+        if own:
+            res = self.client.table("chats").update(data).eq("id", own["id"]).execute()
+            return res.data[0] if res.data else None
+        try:
+            res = self.client.table("chats").insert({**data, "account_id": owner}).execute()
+        except Exception as e:
+            if existing and ("23505" in str(e) or "duplicate" in str(e).lower()):
+                other = existing[0].get("account_id")
+                label = "Основний акаунт"
+                if other:
+                    row = self.get_account(other)
+                    label = (row or {}).get("label") or "інший акаунт"
+                raise ChatConflictError(f"Чат {data['chat_peer']} уже є у списку: {label}") from e
+            raise
+        return res.data[0] if res.data else None
 
     def update_chat(self, chat_id: str, updates: Dict[str, Any]) -> bool:
         """Update fields of a specific chat."""
@@ -219,13 +328,13 @@ class SupabaseDB:
             "last_error": error_msg
         })
 
-    def reactivate_all_chats(self) -> int:
-        """Reset all restricted and error chats back to active status."""
+    def reactivate_all_chats(self, account: Optional[str] = None) -> int:
+        """Reset all restricted and error chats (of one account, or of all) back to active status."""
         if not self.client:
             return 0
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
-            res = (
+            query = self._scoped(
                 self.client.table("chats")
                 .update({
                     "is_active": True,
@@ -233,9 +342,12 @@ class SupabaseDB:
                     "last_error": None,
                     "updated_at": now_iso
                 })
-                .neq("chat_peer", "")
-                .execute()
+                .neq("chat_peer", ""),
+                account,
             )
+            if query is None:
+                return 0
+            res = query.execute()
             count = len(res.data) if res.data else 0
             logger.info(f"Reactivated {count} chats back to active.")
             return count
@@ -524,51 +636,59 @@ class SupabaseDB:
 
     # ==================== LOGS & STATS ====================
 
-    def add_log(self, chat_peer: str, status: str, details: str = ""):
-        """Write an entry to the log table."""
+    def add_log(self, chat_peer: str, status: str, details: str = "", account: Optional[str] = None):
+        """Write an entry to the log table (account = secondary account id; primary/system logs keep NULL)."""
         if not self.client:
             return
         try:
-            self.client.table("logs").insert({
+            row = {
                 "chat_peer": chat_peer,
                 "status": status,
                 "details": details
-            }).execute()
+            }
+            if account and account != PRIMARY_ACCOUNT and self.supports_accounts():
+                row["account_id"] = account
+            self.client.table("logs").insert(row).execute()
         except Exception as e:
             logger.error(f"Error adding log: {e}")
 
-    def get_recent_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_recent_logs(self, limit: int = 50, account: Optional[str] = None) -> List[Dict[str, Any]]:
         """Retrieve recent logs for display."""
         if not self.client:
             return []
         try:
-            res = self.client.table("logs").select("*").order("created_at", desc=True).limit(limit).execute()
+            query = self._scoped(self.client.table("logs").select("*"), account)
+            if query is None:
+                return []
+            res = query.order("created_at", desc=True).limit(limit).execute()
             return res.data or []
         except Exception as e:
             logger.error(f"Error fetching logs: {e}")
             return []
 
-    def get_hourly_post_count(self) -> int:
-        """Count successful posts in the last 60 minutes."""
+    def _count_success_since(self, since_iso: str, account: Optional[str]) -> int:
         if not self.client:
             return 0
         try:
-            one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-            res = self.client.table("logs").select("id", count="exact").eq("status", "success").gte("created_at", one_hour_ago).execute()
-            return res.count or 0
+            query = self._scoped(
+                self.client.table("logs").select("id", count="exact").eq("status", "success").gte("created_at", since_iso),
+                account,
+            )
+            if query is None:
+                return 0
+            return query.execute().count or 0
         except Exception:
             return 0
 
-    def get_daily_post_count(self) -> int:
-        """Count successful posts today (UTC)."""
-        if not self.client:
-            return 0
-        try:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            res = self.client.table("logs").select("id", count="exact").eq("status", "success").gte("created_at", today_start).execute()
-            return res.count or 0
-        except Exception:
-            return 0
+    def get_hourly_post_count(self, account: Optional[str] = None) -> int:
+        """Count successful posts in the last 60 minutes (of one account, or of all)."""
+        one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        return self._count_success_since(one_hour_ago, account)
+
+    def get_daily_post_count(self, account: Optional[str] = None) -> int:
+        """Count successful posts today (UTC) (of one account, or of all)."""
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        return self._count_success_since(today_start, account)
 
     def get_existing_peers_set(self) -> set[str]:
         """Return a set of normalized lowercase chat_peers already in the chats table."""
@@ -589,6 +709,90 @@ class SupabaseDB:
         except Exception as e:
             logger.error(f"Error fetching existing peers set: {e}")
             return set()
+
+    # ==================== POSTING ACCOUNTS ====================
+
+    def get_accounts(self, include_session: bool = False) -> List[Dict[str, Any]]:
+        """List additional posting accounts. Session strings are returned only on request."""
+        if not self.client or not self.supports_accounts():
+            return []
+        fields = f"{ACCOUNT_PUBLIC_FIELDS},session_string" if include_session else ACCOUNT_PUBLIC_FIELDS
+        try:
+            res = self.client.table("accounts").select(fields).order("created_at", desc=False).execute()
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Error fetching accounts: {e}")
+            return []
+
+    def get_account(self, account_id: str, include_session: bool = False) -> Optional[Dict[str, Any]]:
+        if not self.client or not account_id or not self.supports_accounts():
+            return None
+        fields = f"{ACCOUNT_PUBLIC_FIELDS},session_string" if include_session else ACCOUNT_PUBLIC_FIELDS
+        try:
+            res = self.client.table("accounts").select(fields).eq("id", account_id).limit(1).execute()
+            return res.data[0] if res.data else None
+        except Exception as e:
+            logger.error(f"Error fetching account {account_id}: {e}")
+            return None
+
+    def save_account_session(self, user: Dict[str, Any], session_string: str) -> Optional[Dict[str, Any]]:
+        """Store a freshly authorized account; re-login of a known Telegram user refreshes its session."""
+        if not self.client or not self.supports_accounts():
+            return None
+        now_iso = datetime.now(timezone.utc).isoformat()
+        profile = {
+            "first_name": user.get("name"),
+            "username": user.get("username"),
+            "phone": user.get("phone"),
+            "is_premium": bool(user.get("is_premium")),
+            "session_string": session_string,
+            "status": "active",
+            "last_error": None,
+            "updated_at": now_iso,
+        }
+        try:
+            existing = (
+                self.client.table("accounts").select("id").eq("telegram_user_id", user["id"]).limit(1).execute().data
+            )
+            if existing:
+                res = self.client.table("accounts").update(profile).eq("id", existing[0]["id"]).execute()
+            else:
+                label = user.get("name") or (f"@{user['username']}" if user.get("username") else str(user["id"]))
+                res = self.client.table("accounts").insert({
+                    **profile,
+                    "telegram_user_id": user["id"],
+                    "label": label,
+                    "posting_enabled": False,
+                    "created_at": now_iso,
+                }).execute()
+            if not res.data:
+                return None
+            return {k: v for k, v in res.data[0].items() if k != "session_string"}
+        except Exception as e:
+            logger.error(f"Error saving account session for {user.get('id')}: {e}")
+            return None
+
+    def update_account(self, account_id: str, updates: Dict[str, Any]) -> bool:
+        if not self.client or not account_id or not self.supports_accounts():
+            return False
+        try:
+            updates = {**updates, "updated_at": datetime.now(timezone.utc).isoformat()}
+            res = self.client.table("accounts").update(updates).eq("id", account_id).execute()
+            return bool(res.data)
+        except Exception as e:
+            logger.error(f"Error updating account {account_id}: {e}")
+            return False
+
+    def delete_account(self, account_id: str) -> bool:
+        """Delete an account together with its own chat list (ON DELETE CASCADE)."""
+        if not self.client or not account_id or not self.supports_accounts():
+            return False
+        try:
+            res = self.client.table("accounts").delete().eq("id", account_id).execute()
+            return bool(res.data)
+        except Exception as e:
+            logger.error(f"Error deleting account {account_id}: {e}")
+            return False
 
     # ==================== CONTEXTUAL DISCOVERY ====================
 

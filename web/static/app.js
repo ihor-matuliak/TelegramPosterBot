@@ -17,17 +17,20 @@ let currentAuthPhone = '';
 let currentPhoneCodeHash = '';
 let qrPollInterval = null;
 let currentAuthMethod = 'qr';
+let lastSettings = null;
 
 document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
     initEventListeners();
+    initAccountsUI();
     fetchStatus();
-    fetchPosts().then(() => fetchChats());
+    fetchPosts().then(() => fetchAccounts()).then(() => fetchChats());
     fetchLogs();
 
     // Auto-refresh stats and chats every 10 seconds
     setInterval(() => {
         fetchStatus();
+        if (activeTab === 'chats' || activeTab === 'accounts') fetchAccounts();
         if (activeTab === 'chats') fetchChats();
         if (activeTab === 'logs') fetchLogs();
     }, 10000);
@@ -55,6 +58,7 @@ function switchTab(tabId) {
     });
 
     if (tabId === 'chats') fetchChats();
+    if (tabId === 'accounts') fetchAccounts();
     if (tabId === 'post') fetchPosts();
     if (tabId === 'logs') fetchLogs();
     if (tabId === 'settings') fetchStatus();
@@ -318,10 +322,7 @@ async function fetchStatus() {
             : (posterStatus.reason || 'Натисніть, щоб призупинити розсилку');
         renderChatsTable(cachedChats);
 
-        // Update Stat Badges
-        document.getElementById('statTotalChats').textContent = data.total_chats;
-        document.getElementById('statActiveChats').textContent = data.active_chats;
-        document.getElementById('statErrorChats').textContent = data.error_chats;
+        // Chat stat boxes follow the selected account (see renderChatsTable); the nav badge counts all chats
         document.getElementById('chatsNavBadge').textContent = data.total_chats;
 
         // Update Rate Limit Chips
@@ -330,6 +331,7 @@ async function fetchStatus() {
 
         // Settings inputs
         if (data.settings) {
+            lastSettings = data.settings;
             document.getElementById('limitHourly').textContent = data.settings.max_posts_per_hour || 30;
             document.getElementById('limitDaily').textContent = data.settings.max_posts_per_day || 300;
 
@@ -376,7 +378,7 @@ async function toggleMasterPoster() {
 
 async function fetchChats() {
     try {
-        const res = await fetch('/api/chats');
+        const res = await fetch(`/api/chats?${chatsAccountQuery()}`);
         if (!res.ok) throw new Error('Не вдалося отримати чати');
         const chats = await res.json();
         cachedChats = chats;
@@ -388,12 +390,16 @@ async function fetchChats() {
 
 function renderChatsTable(chats) {
     const tbody = document.getElementById('chatsTableBody');
+    document.getElementById('statTotalChats').textContent = chats.length;
+    document.getElementById('statActiveChats').textContent = chats.filter(c => c.is_active).length;
+    document.getElementById('statErrorChats').textContent = chats.filter(c => c.status === 'error' || c.status === 'restricted').length;
     if (!chats.length) {
-        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 30px;">Немає доданих чатів. Натисніть «+ Додати чат» або скористайтесь «🔍 Пошук & Парсер чатів».</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 30px;">Немає доданих чатів у «${escapeHtml(accountLabel(currentChatsAccount))}». Натисніть «+ Додати чат» або «📋 Імпорт списком».</td></tr>`;
         return;
     }
 
     const now = new Date();
+    const accountStatus = currentAccountPosterStatus();
 
     tbody.innerHTML = chats.map(chat => {
         let statusBadge = '';
@@ -416,8 +422,8 @@ function renderChatsTable(chats) {
         if (chat.next_post_at && chat.is_active) {
             const nextDate = new Date(chat.next_post_at);
             const diffMinutes = Math.ceil((nextDate - now) / 60000);
-            if (posterStatus.state !== 'running') {
-                nextPostLabel = `<span class="badge badge-paused">${escapeHtml(posterStatus.reason || 'Очікування розсилки')}</span>`;
+            if (accountStatus.state !== 'running') {
+                nextPostLabel = `<span class="badge badge-paused">${escapeHtml(accountStatus.reason || 'Очікування розсилки')}</span>`;
             } else if (nextDate <= now) {
                 nextPostLabel = `<span style="color: var(--accent-green); font-weight: 600;">У черзі на відправку</span>`;
             } else {
@@ -484,18 +490,22 @@ async function handleAddChat(e) {
     if (!chatPeer) return;
 
     try {
-        await fetch('/api/chats', {
+        const res = await fetch('/api/chats', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_peer: chatPeer, interval_minutes: interval, post_id: postId })
+            body: JSON.stringify({ chat_peer: chatPeer, interval_minutes: interval, post_id: postId, account_id: chatsAccountPayload() })
         });
+        if (!res.ok) {
+            const data = await res.json();
+            throw new Error(data.detail || 'Не вдалося додати чат');
+        }
         closeModal();
         document.getElementById('chatPeerInput').value = '';
         fetchChats();
         fetchPosts();
         fetchStatus();
     } catch (err) {
-        alert('Помилка при додаванні чату: ' + err);
+        alert('Помилка при додаванні чату: ' + (err.message || err));
     }
 }
 
@@ -512,17 +522,20 @@ async function handleBatchChats(e) {
         const res = await fetch('/api/chats/batch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text_links: textLinks, interval_minutes: interval, post_id: postId })
+            body: JSON.stringify({ text_links: textLinks, interval_minutes: interval, post_id: postId, account_id: chatsAccountPayload() })
         });
         const data = await res.json();
-        alert(`Успішно імпортовано: ${data.added_count} чатів!`);
+        if (!res.ok) throw new Error(data.detail || 'Не вдалося імпортувати чати');
+        const conflicts = data.conflicts || [];
+        alert(`Успішно імпортовано: ${data.added_count} чатів у «${accountLabel(currentChatsAccount)}»!` +
+            (conflicts.length ? `\n\nПропущено (вже в іншого акаунта):\n${conflicts.slice(0, 10).join('\n')}` : ''));
         closeModal();
         document.getElementById('batchLinksInput').value = '';
         fetchChats();
         fetchPosts();
         fetchStatus();
     } catch (err) {
-        alert('Помилка імпорту: ' + err);
+        alert('Помилка імпорту: ' + (err.message || err));
     }
 }
 
@@ -717,7 +730,7 @@ async function renderPostAssignedChats(postId) {
                 <label style="display: flex; align-items: center; gap: 8px; background: var(--bg-input); padding: 8px 12px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer; border: 1px solid ${isAssigned ? 'var(--accent-blue)' : 'transparent'};">
                     <input type="checkbox" onchange="togglePostChatLink('${c.id}', '${postId}', this.checked)" ${isAssigned ? 'checked' : ''}>
                     <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(c.title || c.chat_peer)}">
-                        ${escapeHtml(c.title || c.chat_peer)}
+                        ${escapeHtml(c.title || c.chat_peer)}${c.account_id ? ` <span class="log-account-tag">· ${escapeHtml(accountLabel(c.account_id))}</span>` : ''}
                     </span>
                 </label>
             `;
@@ -988,7 +1001,7 @@ async function fetchLogs() {
             return `
                 <div class="log-entry ${log.status}">
                     <div>
-                        <strong>${escapeHtml(log.chat_peer)}</strong>: ${escapeHtml(log.details || log.status)}
+                        ${log.account_id ? `<span class="log-account-tag">[${escapeHtml(accountLabel(log.account_id))}]</span>` : ''}<strong>${escapeHtml(log.chat_peer)}</strong>: ${escapeHtml(log.details || log.status)}
                     </div>
                     <div style="color: var(--text-secondary); font-size: 11px;">
                         ${time}
@@ -1010,6 +1023,7 @@ function openModal(modalId) {
 
 function closeModal() {
     stopQrPolling();
+    if (accountLoginId) cancelAccountLogin();
     document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
 }
 
@@ -1033,10 +1047,16 @@ function handleHeaderAuthClick() {
     }
 }
 
-function openAuthModal() {
+function openAuthModal(mode = 'primary') {
+    if (accountLoginId) cancelAccountLogin();
+    authMode = mode === 'account' ? 'account' : 'primary';
     clearAuthErrors();
+    const title = document.getElementById('authModalTitle');
+    if (title) title.textContent = authMode === 'account' ? 'Додати акаунт для розсилки' : 'Авторизація в Telegram';
+    const botTokenBox = document.getElementById('authBotTokenDetails');
+    if (botTokenBox) botTokenBox.style.display = authMode === 'account' ? 'none' : '';
     const phoneInput = document.getElementById('authPhoneInput');
-    if (phoneInput) phoneInput.value = currentAuthPhone || '+380';
+    if (phoneInput) phoneInput.value = authMode === 'account' ? '+380' : (currentAuthPhone || '+380');
     switchAuthMethod('qr');
     openModal('authModal');
 }
@@ -1150,14 +1170,21 @@ async function handleAuthSendCode() {
     btn.innerHTML = '<span>⏳ Запит коду...</span>';
 
     try {
-        const res = await fetch('/api/auth/send-code', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phone })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.detail || 'Не вдалося надіслати код');
+        let data;
+        if (authMode === 'account') {
+            await cancelAccountLogin();
+            data = await accountLoginRequest('/api/accounts/login/phone', { phone });
+            accountLoginId = data.login_id;
+        } else {
+            const res = await fetch('/api/auth/send-code', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone })
+            });
+            data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.detail || 'Не вдалося надіслати код');
+            }
         }
 
         currentAuthPhone = data.phone || phone;
@@ -1191,23 +1218,28 @@ async function handleAuthVerifyCode() {
     btn.innerHTML = '<span>⏳ Перевірка...</span>';
 
     try {
-        const res = await fetch('/api/auth/verify-code', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                phone: currentAuthPhone,
-                code: code,
-                phone_code_hash: currentPhoneCodeHash
-            })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.detail || 'Помилка перевірки коду');
+        let data;
+        if (authMode === 'account') {
+            data = await accountLoginRequest(`/api/accounts/login/${accountLoginId}/code`, { code });
+        } else {
+            const res = await fetch('/api/auth/verify-code', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    phone: currentAuthPhone,
+                    code: code,
+                    phone_code_hash: currentPhoneCodeHash
+                })
+            });
+            data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.detail || 'Помилка перевірки коду');
+            }
         }
 
         if (data.status === 'needs_2fa') {
             showAuthStep(3);
-        } else if (data.status === 'ok') {
+        } else if (data.status === 'ok' || data.status === 'success') {
             handleAuthSuccess(data.user);
         }
     } catch (err) {
@@ -1233,7 +1265,9 @@ async function handleAuthVerify2FA() {
     btn.innerHTML = '<span>⏳ Перевірка...</span>';
 
     try {
-        const endpoint = currentAuthMethod === 'qr' ? '/api/auth/qr/2fa' : '/api/auth/verify-2fa';
+        const endpoint = authMode === 'account'
+            ? `/api/accounts/login/${accountLoginId}/password`
+            : (currentAuthMethod === 'qr' ? '/api/auth/qr/2fa' : '/api/auth/verify-2fa');
         const res = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1244,7 +1278,7 @@ async function handleAuthVerify2FA() {
             throw new Error(data.detail || data.message || 'Невірний пароль 2FA');
         }
 
-        if (data.status === 'ok') {
+        if (data.status === 'ok' || data.status === 'success') {
             handleAuthSuccess(data.user);
         }
     } catch (err) {
@@ -1258,6 +1292,17 @@ async function handleAuthVerify2FA() {
 function handleAuthSuccess(user) {
     stopQrPolling();
     const detailsEl = document.getElementById('authSuccessDetails');
+    if (authMode === 'account') {
+        if (detailsEl) {
+            detailsEl.innerHTML = `
+                <div>Акаунт <strong>${escapeHtml((user && user.name) || '')}</strong> (@${escapeHtml((user && user.username) || 'без юзернейму')}) додано для розсилки.</div>
+                <div style="font-size: 13px; color: var(--text-secondary); margin-top: 6px;">Розсилка з нього поки вимкнена: додайте йому чати у вкладці «Цільові чати» і увімкніть розсилку в картці акаунта.</div>
+            `;
+        }
+        showAuthStep(4);
+        fetchAccounts();
+        return;
+    }
     if (user && detailsEl) {
         if (user.is_bot) {
             detailsEl.innerHTML = `
@@ -1338,6 +1383,7 @@ function switchAuthMethod(method) {
         startQrAuth();
     } else {
         stopQrPolling();
+        if (authMode === 'account') cancelAccountLogin();
         if (btnQr) { btnQr.className = 'tg-btn tg-btn-secondary'; }
         if (btnPhone) { btnPhone.className = 'tg-btn tg-btn-primary'; }
         if (stepQr) stepQr.classList.remove('active');
@@ -1369,8 +1415,15 @@ async function startQrAuth() {
     }
 
     try {
-        const res = await fetch('/api/auth/qr/start', { method: 'POST' });
-        const data = await res.json();
+        let data;
+        if (authMode === 'account') {
+            await cancelAccountLogin();
+            data = await accountLoginRequest('/api/accounts/login/qr');
+            accountLoginId = data.login_id;
+        } else {
+            const res = await fetch('/api/auth/qr/start', { method: 'POST' });
+            data = await res.json();
+        }
         if (data.status === 'error') {
             throw new Error(data.error || 'Не вдалося створити QR-код');
         }
@@ -1400,7 +1453,11 @@ function stopQrPolling() {
 
 async function checkQrStatus() {
     try {
-        const res = await fetch('/api/auth/qr/status');
+        const statusUrl = authMode === 'account'
+            ? (accountLoginId ? `/api/accounts/login/${accountLoginId}` : null)
+            : '/api/auth/qr/status';
+        if (!statusUrl) return;
+        const res = await fetch(statusUrl);
         if (!res.ok) return;
         const data = await res.json();
 
@@ -1439,7 +1496,7 @@ async function handleReactivateAllChats() {
         btn.textContent = '⏳ Відновлення...';
     }
     try {
-        const res = await fetch('/api/chats/reactivate-all', { method: 'POST' });
+        const res = await fetch(`/api/chats/reactivate-all?${chatsAccountQuery()}`, { method: 'POST' });
         const data = await res.json();
         alert(data.message || 'Чати успішно відновлено!');
         await fetchChats();

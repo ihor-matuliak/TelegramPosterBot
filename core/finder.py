@@ -16,7 +16,7 @@ from telethon.tl.types import Channel, InputMessagesFilterEmpty, InputPeerEmpty
 from config import config
 from core.client import client
 from core.discovery_relevance import clean_text
-from database.client import db
+from database.client import db, ChatConflictError
 
 logger = logging.getLogger("ChatFinder")
 
@@ -174,6 +174,8 @@ class ChatFinder:
             return {"status": "error", "message": f"Telegram просить зачекати {exc.seconds} с перед вступом.", "retry_after": exc.seconds}
         except errors.InviteRequestSentError:
             return {"status": "error", "message": "Заявку на вступ надіслано. Дочекайтеся схвалення адміністратора."}
+        except ChatConflictError as exc:
+            return {"status": "error", "message": str(exc)}
         except Exception as exc:
             logger.warning("Unable to add discovered chat (%s)", type(exc).__name__)
             return {"status": "error", "message": "Не вдалося приєднатися або додати чат. Перевірте доступ."}

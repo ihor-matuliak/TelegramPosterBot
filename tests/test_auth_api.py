@@ -16,6 +16,9 @@ telegram.login_with_bot_token = AsyncMock(return_value={
     "user": {"id": 8956589067, "name": "Bot", "username": "reddfan_poster_bot", "is_bot": True}
 })
 
+telegram.login_with_bot_token = getattr(telegram, "login_with_bot_token", AsyncMock())
+telegram.qr_auth = getattr(telegram, "qr_auth", MagicMock())
+
 from fastapi.testclient import TestClient
 from telethon.errors import (
     PhoneNumberInvalidError,

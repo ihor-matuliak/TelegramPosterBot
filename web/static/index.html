@@ -52,6 +52,10 @@
                 <span>💬 Цільові чати</span>
                 <span id="chatsNavBadge" class="nav-badge">0</span>
             </button>
+            <button class="nav-item" data-tab="accounts">
+                <span>👥 Акаунти розсилки</span>
+                <span id="accountsNavBadge" class="nav-badge">1</span>
+            </button>
             <button class="nav-item" data-tab="finder">
                 <span>🔍 Пошук & Парсер чатів</span>
             </button>
@@ -114,7 +118,13 @@
                 <!-- Chats Table Card -->
                 <div class="tg-card">
                     <div class="card-header">
-                        <div class="card-title">Список підключених чатів для розсилки</div>
+                        <div class="chats-header-left">
+                            <div class="card-title">Список чатів для розсилки</div>
+                            <label id="chatsAccountPicker" class="account-picker" hidden>
+                                <span>Акаунт:</span>
+                                <select id="chatsAccountSelect" class="tg-select"></select>
+                            </label>
+                        </div>
                         <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                             <button id="reactivateAllChatsBtn" class="tg-btn tg-btn-secondary" title="Відновити всі чати зі статусу помилок/обмежень у статус активних">🔄 Відновити всі чати</button>
                             <button id="openBatchModalBtn" class="tg-btn tg-btn-secondary">📋 Імпорт списком</button>
@@ -143,6 +153,34 @@
                                 </tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB: POSTING ACCOUNTS -->
+            <div id="tab-accounts" class="tab-pane">
+                <div class="tg-card">
+                    <div class="card-header">
+                        <div>
+                            <div class="card-title">👥 Акаунти для розсилки</div>
+                            <div class="card-subtitle">У кожного акаунта свій список чатів, власні ліміти та аварійна пауза. Варіанти постів спільні для всіх.</div>
+                        </div>
+                        <button type="button" id="addAccountBtn" class="tg-btn tg-btn-primary">+ Додати акаунт</button>
+                    </div>
+                    <div id="accountsMigrationNotice" class="accounts-notice" hidden>
+                        ⚠️ <strong>Додаткові акаунти ще не активовані.</strong> Виконайте міграцію
+                        <code>database/migrations/20261015_multi_accounts.sql</code> у Supabase SQL Editor і оновіть сторінку.
+                    </div>
+                    <div id="accountsWorkersNotice" class="accounts-notice" hidden>
+                        ⚠️ На цьому сервері <code>ACCOUNT_WORKERS_ENABLED=false</code>: додаткові акаунти звідси не постять.
+                    </div>
+                    <div id="accountsGrid" class="accounts-grid">
+                        <div class="accounts-empty">Завантаження акаунтів...</div>
+                    </div>
+                    <div class="accounts-hint">
+                        💡 Новий акаунт додається з <strong>вимкненою</strong> розсилкою: спершу додайте йому чати, потім увімкніть.
+                        Перед першим постом у чат акаунт сам вступає в нього. Пости зі «Збережених» він надсилає як HTML-текст
+                        (оригінал зберігається в основному акаунті, тому медіа з такого поста не передаються).
                     </div>
                 </div>
             </div>
@@ -481,6 +519,7 @@
     <div id="addChatModal" class="modal-overlay">
         <div class="tg-modal">
             <div class="modal-title">Додати новий цільовий чат</div>
+            <div class="modal-account-target">Акаунт: <strong class="js-target-account">Основний</strong></div>
             <form id="addChatForm" style="display: flex; flex-direction: column; gap: 14px;">
                 <div>
                     <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
@@ -526,6 +565,7 @@
     <div id="batchModal" class="modal-overlay">
         <div class="tg-modal">
             <div class="modal-title">Масовий імпорт списку чатів</div>
+            <div class="modal-account-target">Акаунт: <strong class="js-target-account">Основний</strong></div>
             <form id="batchChatForm" style="display: flex; flex-direction: column; gap: 14px;">
                 <div>
                     <label style="font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; display: block;">
@@ -624,7 +664,7 @@
                     </div>
 
                     <!-- Collapsed bot token with explicit warning -->
-                    <details style="margin-top: 18px; padding: 10px 12px; border-radius: 8px; background: rgba(255,255,255,0.02); font-size: 12px; border: 1px dashed rgba(255,255,255,0.12);">
+                    <details id="authBotTokenDetails" style="margin-top: 18px; padding: 10px 12px; border-radius: 8px; background: rgba(255,255,255,0.02); font-size: 12px; border: 1px dashed rgba(255,255,255,0.12);">
                         <summary style="cursor: pointer; color: var(--tg-text-muted); font-weight: 500;">
                             🛠️ Додатково: Авторизація через Bot Token (BotFather)
                         </summary>
@@ -735,6 +775,7 @@
     </div>
 
     <script src="/static/discovery.js"></script>
+    <script src="/static/accounts.js"></script>
     <script src="/static/app.js"></script>
 </body>
 </html>

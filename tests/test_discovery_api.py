@@ -12,6 +12,9 @@ telegram_module.init_telegram_client = AsyncMock()
 telegram_module.reset_client_session = AsyncMock()
 telegram_module.logout_client = AsyncMock()
 
+telegram_module.login_with_bot_token = getattr(telegram_module, "login_with_bot_token", AsyncMock())
+telegram_module.qr_auth = getattr(telegram_module, "qr_auth", MagicMock())
+
 from fastapi.testclient import TestClient
 from web.api import web_app
 from database.discovery import DiscoveryStorageError

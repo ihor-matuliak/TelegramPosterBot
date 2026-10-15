@@ -11,6 +11,9 @@ telegram.init_telegram_client = AsyncMock()
 telegram.reset_client_session = AsyncMock()
 telegram.logout_client = AsyncMock()
 
+telegram.login_with_bot_token = getattr(telegram, "login_with_bot_token", AsyncMock())
+telegram.qr_auth = getattr(telegram, "qr_auth", MagicMock())
+
 from fastapi.testclient import TestClient
 from web.api import web_app
 from database.client import SupabaseDB

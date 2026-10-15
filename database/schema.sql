@@ -239,3 +239,34 @@ ON public.discovery_results (created_at DESC, id DESC);
 
 COMMIT;
 NOTIFY pgrst, 'reload schema';
+
+-- ==========================================================
+-- ADDITIONAL POSTING ACCOUNTS (see migrations/20261015_multi_accounts.sql)
+-- account_id = NULL on chats/logs means the primary account.
+-- ==========================================================
+CREATE TABLE IF NOT EXISTS public.accounts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    label TEXT NOT NULL DEFAULT '',
+    telegram_user_id BIGINT UNIQUE,
+    first_name TEXT DEFAULT NULL,
+    username TEXT DEFAULT NULL,
+    phone TEXT DEFAULT NULL,
+    is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+    session_string TEXT NOT NULL,                   -- Telethon StringSession (secret!)
+    posting_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    status TEXT NOT NULL DEFAULT 'active',          -- 'active', 'unauthorized', 'error'
+    last_error TEXT DEFAULT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE public.chats ADD COLUMN IF NOT EXISTS account_id UUID REFERENCES public.accounts(id) ON DELETE CASCADE;
+ALTER TABLE public.logs ADD COLUMN IF NOT EXISTS account_id UUID;
+CREATE INDEX IF NOT EXISTS idx_chats_account ON public.chats(account_id);
+CREATE INDEX IF NOT EXISTS idx_logs_account_status ON public.logs(account_id, status, created_at DESC);
+ALTER TABLE public.accounts ENABLE ROW LEVEL SECURITY;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Allow full access to accounts') THEN
+        CREATE POLICY "Allow full access to accounts" ON public.accounts FOR ALL USING (true) WITH CHECK (true);
+    END IF;
+END $$;

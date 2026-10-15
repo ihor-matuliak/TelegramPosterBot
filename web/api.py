@@ -18,7 +18,7 @@ from telethon.errors import (
     PasswordHashInvalidError,
     PhoneNumberBannedError
 )
-from database.client import db
+from database.client import db, ChatConflictError, PRIMARY_ACCOUNT
 from core.client import (
     client,
     init_telegram_client,
@@ -63,6 +63,7 @@ from core.finder import ChatFinder
 from core.poster import poster_worker
 from core.ai_discovery import AIDiscoveryEngine
 from web.discovery_api import router as discovery_router, manager as discovery_manager
+from web.accounts_api import router as accounts_router, resolve_account_key
 from database.discovery import DiscoveryStorageError
 
 logger = logging.getLogger("WebAPI")
@@ -79,6 +80,7 @@ async def lifespan(app: FastAPI):
 
 web_app = FastAPI(title="Telegram Auto-Poster Dashboard", lifespan=lifespan)
 web_app.include_router(discovery_router)
+web_app.include_router(accounts_router)
 
 
 @web_app.exception_handler(DiscoveryStorageError)
@@ -95,11 +97,13 @@ class ChatCreateRequest(BaseModel):
     interval_minutes: int = 60
     title: Optional[str] = ""
     post_id: Optional[str] = None
+    account_id: Optional[str] = None  # None / "primary" = primary account
 
 class BatchChatsRequest(BaseModel):
     text_links: str
     interval_minutes: int = 60
     post_id: Optional[str] = None
+    account_id: Optional[str] = None
 
 class ChatUpdateRequest(BaseModel):
     interval_minutes: Optional[int] = None
@@ -201,8 +205,9 @@ async def get_system_status():
     chats = db.get_all_chats()
     active_chats = sum(1 for c in chats if c.get("is_active"))
     error_chats = sum(1 for c in chats if c.get("status") in ["error", "restricted"])
-    hourly_count = db.get_hourly_post_count()
-    daily_count = db.get_daily_post_count()
+    # Rate limits apply per Telegram account; the header shows the primary account.
+    hourly_count = db.get_hourly_post_count(PRIMARY_ACCOUNT)
+    daily_count = db.get_daily_post_count(PRIMARY_ACCOUNT)
 
     is_bot_account = user_info.get("is_bot", False) if user_info else False
 
@@ -217,6 +222,7 @@ async def get_system_status():
         "error_chats": error_chats,
         "hourly_posts": hourly_count,
         "daily_posts": daily_count,
+        "accounts_ready": bool(db.supports_accounts()),
         "settings": settings
     }
 
@@ -245,14 +251,21 @@ async def update_settings(req: SettingsUpdateRequest):
 
 
 @web_app.get("/api/chats")
-async def get_chats():
-    return db.get_all_chats()
+async def get_chats(account: Optional[str] = None):
+    """All chats, or only the list of one account (account=primary or account UUID)."""
+    if account is None or account == "all":
+        return db.get_all_chats()
+    return db.get_all_chats(resolve_account_key(account))
 
 
 @web_app.post("/api/chats")
 async def add_chat(req: ChatCreateRequest):
     post_id = req.post_id if req.post_id and req.post_id != "default" else None
-    res = db.add_chat(req.chat_peer, req.interval_minutes, req.title or "", post_id=post_id)
+    account = resolve_account_key(req.account_id)
+    try:
+        res = db.add_chat(req.chat_peer, req.interval_minutes, req.title or "", post_id=post_id, account=account)
+    except ChatConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not res:
         raise HTTPException(status_code=400, detail="Не вдалося додати чат")
     return res
@@ -263,7 +276,9 @@ async def add_chats_batch(req: BatchChatsRequest):
     """Parse text and extract multiple chat usernames/links."""
     lines = req.text_links.strip().split("\n")
     added = 0
+    conflicts: List[str] = []
     post_id = req.post_id if req.post_id and req.post_id != "default" else None
+    account = resolve_account_key(req.account_id)
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
@@ -273,9 +288,12 @@ async def add_chats_batch(req: BatchChatsRequest):
             peer = match.group(1)
             if not peer.startswith("+") and not peer.startswith("@") and not peer.startswith("joinchat"):
                 peer = f"@{peer}"
-            db.add_chat(peer, req.interval_minutes, post_id=post_id)
-            added += 1
-    return {"status": "ok", "added_count": added}
+            try:
+                if db.add_chat(peer, req.interval_minutes, post_id=post_id, account=account):
+                    added += 1
+            except ChatConflictError as e:
+                conflicts.append(str(e))
+    return {"status": "ok", "added_count": added, "conflicts": conflicts}
 
 
 @web_app.put("/api/chats/{chat_id}")
@@ -298,9 +316,9 @@ async def delete_chat(chat_id: str):
 
 
 @web_app.post("/api/chats/reactivate-all")
-async def reactivate_all_chats():
-    """Reset all chats from error/restricted states back to active."""
-    count = db.reactivate_all_chats()
+async def reactivate_all_chats(account: Optional[str] = None):
+    """Reset chats (of one account when given) from error/restricted states back to active."""
+    count = db.reactivate_all_chats(None if account in (None, "all") else resolve_account_key(account))
     return {
         "status": "ok",
         "message": f"Відновлено {count} чатів з помилок/обмежень у статус активних.",
@@ -461,8 +479,10 @@ async def finder_batch_add(req: BatchJoinAddRequest):
 
 
 @web_app.get("/api/logs")
-async def get_logs(limit: int = 50):
-    return db.get_recent_logs(limit)
+async def get_logs(limit: int = 50, account: Optional[str] = None):
+    if account is None or account == "all":
+        return db.get_recent_logs(limit)
+    return db.get_recent_logs(limit, resolve_account_key(account))
 
 
 # ==================== TELEGRAM UI AUTHENTICATION ====================

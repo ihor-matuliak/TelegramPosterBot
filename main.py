@@ -5,6 +5,7 @@ import uvicorn
 from config import config
 from core.client import init_telegram_client
 from core.poster import poster_worker
+from core.accounts import account_posters, account_logins
 from web.api import web_app
 from bot.admin_bot import run_admin_bot
 
@@ -43,8 +44,9 @@ async def main():
     except Exception as e:
         logger.error(f"Помилка ініціалізації Telegram клієнта: {e}")
 
-    # 2. Start Poster Worker Engine
+    # 2. Start Poster Worker Engine (primary account) and workers of additional accounts
     await poster_worker.start()
+    await account_posters.start()
 
     # 3. Launch Web Dashboard, Admin Bot, and Worker concurrently
     try:
@@ -57,6 +59,8 @@ async def main():
         logger.info("Зупинка системи...")
     finally:
         await poster_worker.stop()
+        await account_posters.stop()
+        await account_logins.close()
         logger.info("Всі процеси коректно зупинено.")
 
 

@@ -180,7 +180,7 @@ class PosterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_daily_limit_stops_fetched_batch(self):
         self.settings["max_posts_per_day"] = 1
-        self.db.get_daily_post_count.side_effect = lambda: self.client.send_message.await_count
+        self.db.get_daily_post_count.side_effect = lambda *_: self.client.send_message.await_count
         async def wait(seconds, reason):
             if "добового" in reason:
                 self.worker._is_active = False

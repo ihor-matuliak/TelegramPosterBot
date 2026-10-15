@@ -20,6 +20,9 @@ def get_main_menu_keyboard(is_running: bool, is_authorized: bool = True) -> Inli
             InlineKeyboardButton(text="⭐ 📥 Завантажити зі «Збережених»", callback_data="btn_sync_saved")
         ],
         [
+            InlineKeyboardButton(text="👥 Акаунти розсилки", callback_data="acc_list")
+        ],
+        [
             InlineKeyboardButton(
                 text="👤 Telegram Акаунт" if is_authorized else "🔑 Авторизуватись в Telegram",
                 callback_data="btn_tg_auth"

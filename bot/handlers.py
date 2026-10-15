@@ -121,6 +121,11 @@ async def get_status_text() -> str:
     auth_str = "🟢 Підключено" if is_auth else "⚠️ Не авторизовано"
 
     status_emoji = "🟢 АКТИВНИЙ" if is_running else "⏸️ НА ПАУЗІ"
+    accounts = db.get_accounts()
+    accounts_line = ""
+    if accounts:
+        enabled = sum(1 for a in accounts if a.get("posting_enabled"))
+        accounts_line = f"• Додаткових акаунтів: <b>{len(accounts)}</b> (з розсилкою: {enabled})\n"
     pause_details = ""
     if not is_running:
         event = db.get_poster_control_event()
@@ -132,6 +137,7 @@ async def get_status_text() -> str:
         f"• Telegram Userbot: <b>{auth_str}</b>\n"
         f"• Статус розсилки: <b>{status_emoji}</b>\n"
         f"{pause_details}"
+        f"{accounts_line}"
         f"• Всього чатів: <b>{len(chats)}</b> (активних: {active_chats})\n"
         f"• Варіантів постів: <b>{len(posts)}</b>\n"
         f"• Помилок / обмежень: <b>{error_chats}</b>\n"
@@ -220,8 +226,8 @@ async def cb_pause(call: CallbackQuery):
         return
     poster_worker.reset_errors()
     await call.message.edit_text(
-        get_status_text(),
-        reply_markup=get_main_menu_keyboard(False),
+        await get_status_text(),
+        reply_markup=get_main_menu_keyboard(False, await check_user_authorized()),
         parse_mode="HTML"
     )
     await call.answer("⏸️ Розсилку призупинено!", show_alert=True)
@@ -238,8 +244,8 @@ async def cb_resume(call: CallbackQuery):
         return
     poster_worker.reset_errors()
     await call.message.edit_text(
-        get_status_text(),
-        reply_markup=get_main_menu_keyboard(True),
+        await get_status_text(),
+        reply_markup=get_main_menu_keyboard(True, await check_user_authorized()),
         parse_mode="HTML"
     )
     await call.answer("▶️ Розсилку успішно запущено!", show_alert=True)

@@ -16,6 +16,8 @@ function setup() {
         },
     };
     vm.createContext(context);
+    // Same order as index.html: accounts.js provides the per-account chat scope.
+    vm.runInContext(fs.readFileSync('web/static/accounts.js', 'utf8'), context);
     vm.runInContext(fs.readFileSync('web/static/app.js', 'utf8'), context);
     context.chats = [{ id: 'one', chat_peer: '@test', is_active: true,
         interval_minutes: 60, next_post_at: new Date(Date.now() - 60000).toISOString() }];
