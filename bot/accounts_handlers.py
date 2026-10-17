@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import config
 from core.accounts import AccountLoginError, account_logins, account_posters
 from core.client import describe_sent_code_type, normalize_phone
-from database.client import ACCOUNTS_MIGRATION, PRIMARY_ACCOUNT, ChatConflictError, db
+from database.client import ACCOUNTS_MIGRATION, PRIMARY_ACCOUNT, ChatConflictError, ChatSaveError, db
 
 logger = logging.getLogger("AdminBot.Accounts")
 router = Router()
@@ -442,20 +442,22 @@ async def cb_account_chats_post(call: CallbackQuery, state: FSMContext):
     interval = data.get("interval", 1440)
     await state.clear()
     await call.answer("⏳ Додаємо чати...")
-    added, conflicts, failed = 0, [], 0
+    added, conflicts, failed = 0, [], []
     for peer in peers:
         try:
             if db.add_chat(peer, interval, post_id=post_id, account=key):
                 added += 1
             else:
-                failed += 1
+                failed.append(f"Не вдалося зберегти чат {peer}")
         except ChatConflictError as e:
             conflicts.append(str(e))
+        except ChatSaveError as e:
+            failed.append(str(e))
     report = f"✅ Додано чатів: <b>{added}</b> з {len(peers)} у «{escape(_label(key))}»."
     if conflicts:
         report += "\n\n⚠️ Пропущено (вже в іншого акаунта):\n" + "\n".join(f"• {escape(c)}" for c in conflicts[:10])
     if failed:
-        report += f"\n\n❌ Не вдалося зберегти: {failed}"
+        report += f"\n\n❌ Не вдалося зберегти ({len(failed)}):\n" + "\n".join(f"• {escape(f)}" for f in failed[:10])
     if key != PRIMARY_ACCOUNT and not (db.get_account(key) or {}).get("posting_enabled"):
         report += "\n\n💡 Розсилка з цього акаунта вимкнена — увімкніть її в картці акаунта."
     text, markup = _chats_view(key, 0)

@@ -25,7 +25,11 @@ LEASE_FIELDS = "worker_id,worker_host,worker_heartbeat_at"
 LEASE_MIGRATION = "database/migrations/20261017_account_worker_lease.sql"
 
 
-class ChatConflictError(Exception):
+class ChatSaveError(Exception):
+    """The chat could not be stored; the message says why (shown to the user)."""
+
+
+class ChatConflictError(ChatSaveError):
     """The chat already belongs to another account's list."""
 
 
@@ -181,7 +185,8 @@ class SupabaseDB:
         """Add or update a target chat of one account with optional specific post_id.
 
         Raises ChatConflictError when the chat already belongs to another account
-        and the database still allows a chat in only one list.
+        and the database still allows a chat in only one list, and ChatSaveError
+        with the database's reason for any other failure.
         """
         if not self.client:
             return None
@@ -211,6 +216,7 @@ class SupabaseDB:
                     local_map = self._load_local_chat_posts()
                     local_map[chat_record["id"]] = post_id
                     self._save_local_chat_posts(local_map)
+                    chat_record["post_id"] = post_id
                 return chat_record
 
             chat_record = None
@@ -232,13 +238,25 @@ class SupabaseDB:
                 chat_record["post_id"] = post_id
 
             return chat_record
-        except ChatConflictError:
+        except ChatSaveError:
             raise
         except Exception as e:
             logger.error(f"Error adding chat {chat_peer}: {e}")
-            return None
+            reason = getattr(e, "message", None) or str(e)
+            raise ChatSaveError(f"Не вдалося зберегти чат {chat_peer}: {reason}") from e
 
     def _save_account_chat(self, data: Dict[str, Any], account: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self._write_account_chat(data, account)
+        except ChatSaveError:
+            raise
+        except Exception as e:
+            if "post_id" in data and ("post_id" in str(e) or "PGRST204" in str(e)):
+                # Databases without chats.post_id keep the assignment in data/chat_posts.json (see add_chat).
+                return self._write_account_chat({k: v for k, v in data.items() if k != "post_id"}, account)
+            raise
+
+    def _write_account_chat(self, data: Dict[str, Any], account: str) -> Optional[Dict[str, Any]]:
         """Update the chat in this account's list or insert it, never moving it from another account.
 
         Works both with the legacy UNIQUE(chat_peer) constraint and with the

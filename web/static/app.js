@@ -528,7 +528,7 @@ async function handleBatchChats(e) {
         if (!res.ok) throw new Error(data.detail || 'Не вдалося імпортувати чати');
         const conflicts = data.conflicts || [];
         alert(`Успішно імпортовано: ${data.added_count} чатів у «${accountLabel(currentChatsAccount)}»!` +
-            (conflicts.length ? `\n\nПропущено (вже в іншого акаунта):\n${conflicts.slice(0, 10).join('\n')}` : ''));
+            (conflicts.length ? `\n\nПропущено:\n${conflicts.slice(0, 10).join('\n')}` : ''));
         closeModal();
         document.getElementById('batchLinksInput').value = '';
         fetchChats();

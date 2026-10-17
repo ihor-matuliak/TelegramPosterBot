@@ -18,7 +18,7 @@ from telethon.errors import (
     PasswordHashInvalidError,
     PhoneNumberBannedError
 )
-from database.client import db, ChatConflictError, PRIMARY_ACCOUNT
+from database.client import db, ChatConflictError, ChatSaveError, PRIMARY_ACCOUNT
 from core.client import (
     client,
     init_telegram_client,
@@ -258,14 +258,31 @@ async def get_chats(account: Optional[str] = None):
     return db.get_all_chats(resolve_account_key(account))
 
 
+def normalize_chat_peer(raw: str) -> str:
+    """Store one chat in one form: t.me links and bare usernames become @username, invite links stay links."""
+    peer = raw.strip()
+    match = re.match(r"^(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(.+)$", peer, re.IGNORECASE)
+    if match:
+        rest = match.group(1).split("?")[0].strip("/")
+        if rest.startswith("+") or rest.lower().startswith("joinchat/"):
+            return f"https://t.me/{rest}"
+        return f"@{rest.split('/')[0]}"
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", peer):
+        return f"@{peer}"
+    return peer
+
+
 @web_app.post("/api/chats")
 async def add_chat(req: ChatCreateRequest):
     post_id = req.post_id if req.post_id and req.post_id != "default" else None
     account = resolve_account_key(req.account_id)
     try:
-        res = db.add_chat(req.chat_peer, req.interval_minutes, req.title or "", post_id=post_id, account=account)
+        res = db.add_chat(normalize_chat_peer(req.chat_peer), req.interval_minutes, req.title or "",
+                          post_id=post_id, account=account)
     except ChatConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except ChatSaveError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not res:
         raise HTTPException(status_code=400, detail="Не вдалося додати чат")
     return res
@@ -291,7 +308,8 @@ async def add_chats_batch(req: BatchChatsRequest):
             try:
                 if db.add_chat(peer, req.interval_minutes, post_id=post_id, account=account):
                     added += 1
-            except ChatConflictError as e:
+            except ChatSaveError as e:
+                # Conflicts and database failures are reported per chat instead of being dropped silently.
                 conflicts.append(str(e))
     return {"status": "ok", "added_count": added, "conflicts": conflicts}
 

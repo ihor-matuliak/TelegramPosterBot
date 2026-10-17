@@ -27,7 +27,7 @@ from telethon.tl.types import Channel, ChatPhotoEmpty, InputPeerChannel
 
 from core.accounts import AccountLogin, AccountLoginError, AccountLoginManager, AccountPosterSupervisor
 from core.poster import PostOutcome, PosterWorker
-from database.client import PRIMARY_ACCOUNT, ChatConflictError, SupabaseDB
+from database.client import PRIMARY_ACCOUNT, ChatConflictError, ChatSaveError, SupabaseDB
 
 ACCOUNT = str(uuid4())
 
@@ -90,6 +90,60 @@ class AccountScopeStorageTests(unittest.TestCase):
         self.assertNotIn("PATCH", [m for m, _ in calls])
         insert = json.loads(calls[-1][1].content)
         self.assertEqual(insert["account_id"], ACCOUNT)
+
+    def test_same_chat_in_two_accounts_after_phase_two(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"id": "c1", "account_id": None}])
+            return httpx.Response(201, json=[{"id": "c2", "chat_peer": "@shared", "account_id": ACCOUNT}])
+
+        db, http = make_db(handle)
+        with http:
+            saved = db.add_chat("@shared", 60, account=ACCOUNT)
+        self.assertEqual(saved["id"], "c2")
+        self.assertEqual(calls[-1].method, "POST")  # the primary account's row is left untouched
+
+    def test_chat_with_post_is_saved_when_database_has_no_post_id_column(self):
+        # Production: chats.post_id does not exist, the assignment lives in data/chat_posts.json.
+        inserts = []
+
+        def handle(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"id": "c1", "account_id": None}])
+            body = json.loads(request.content)
+            inserts.append(body)
+            if "post_id" in body:
+                return httpx.Response(400, json={"code": "PGRST204", "hint": None, "details": None,
+                                                 "message": "Could not find the 'post_id' column of 'chats' in the schema cache"})
+            return httpx.Response(201, json=[{**body, "id": "c2"}])
+
+        db, http = make_db(handle)
+        saved_map = {}
+        with http, patch.object(SupabaseDB, "_load_local_chat_posts", return_value={}), \
+                patch.object(SupabaseDB, "_save_local_chat_posts", side_effect=saved_map.update):
+            saved = db.add_chat("@desk_lion", 60, post_id="p1", account=ACCOUNT)
+        self.assertEqual(saved["id"], "c2")
+        self.assertEqual(saved["post_id"], "p1")
+        self.assertEqual(saved_map, {"c2": "p1"})
+        self.assertEqual(len(inserts), 2)
+        self.assertNotIn("post_id", inserts[1])
+        self.assertEqual(inserts[1]["account_id"], ACCOUNT)
+
+    def test_database_failure_reports_its_reason(self):
+        def handle(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=[])
+            return httpx.Response(409, json={"code": "23503", "message": "violates foreign key constraint",
+                                             "hint": None, "details": None})
+
+        db, http = make_db(handle)
+        with http, self.assertRaises(ChatSaveError) as ctx:
+            db.add_chat("@x", 60, account=ACCOUNT)
+        self.assertNotIsInstance(ctx.exception, ChatConflictError)
+        self.assertIn("foreign key", str(ctx.exception))
 
     def test_existing_chat_of_same_account_is_updated_in_place(self):
         calls = []
@@ -452,6 +506,18 @@ class AccountsAPITests(unittest.TestCase):
         self.assertEqual(self.http.get("/api/chats?account=bad").status_code, 400)
         self.db.get_account.return_value = None
         self.assertEqual(self.http.get(f"/api/chats?account={ACCOUNT}").status_code, 404)
+
+    def test_save_failure_reason_reaches_the_user(self):
+        self.db.add_chat.side_effect = ChatSaveError("Не вдалося зберегти чат @x: violates foreign key constraint")
+        res = self.http.post("/api/chats", json={"chat_peer": "@x", "account_id": ACCOUNT})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("foreign key", res.json()["detail"])
+
+    def test_single_chat_link_is_stored_as_username(self):
+        self.http.post("/api/chats", json={"chat_peer": "https://t.me/PandaDesk", "account_id": ACCOUNT})
+        self.assertEqual(self.db.add_chat.call_args.args[0], "@PandaDesk")
+        self.http.post("/api/chats", json={"chat_peer": "https://t.me/+Invite123", "account_id": ACCOUNT})
+        self.assertEqual(self.db.add_chat.call_args.args[0], "https://t.me/+Invite123")
 
     def test_chats_listing_is_scoped(self):
         self.http.get("/api/chats?account=primary")
