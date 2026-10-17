@@ -19,7 +19,14 @@ from telethon.errors.rpcerrorlist import (
     InviteHashInvalidError,
     ChannelsTooMuchError,
 )
-from telethon.errors import RPCError
+from telethon.errors import (
+    RPCError,
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+)
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, SetTypingRequest
 from telethon.tl.types import Channel, SendMessageTypingAction
@@ -28,6 +35,25 @@ from core.spintax import SpintaxEngine
 from database.client import db, PRIMARY_ACCOUNT
 
 logger = logging.getLogger("PosterEngine")
+
+
+# The session can never be used again; only a new login helps.
+SESSION_DEAD_ERRORS = (
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+)
+
+
+def session_dead_reason(exc: Exception) -> str:
+    if isinstance(exc, AuthKeyDuplicatedError):
+        return ("Telegram анулював сесію: її використовували одночасно з двох IP-адрес "
+                "(дві запущені копії програми або перекриття під час деплою). Додайте акаунт повторно.")
+    if isinstance(exc, (UserDeactivatedError, UserDeactivatedBanError)):
+        return "Telegram-акаунт видалено або заблоковано."
+    return "Сесію акаунта завершено в Telegram. Додайте акаунт повторно."
 
 
 class PostOutcome(Enum):
@@ -159,6 +185,9 @@ class PosterWorker:
         if not self.is_primary and not tg.is_connected():
             try:
                 await tg.connect()
+            except SESSION_DEAD_ERRORS as dead:
+                self._mark_session_dead(session_dead_reason(dead))
+                return False
             except Exception as conn_err:
                 self._log.warning(f"Reconnect failed: {conn_err}")
         if tg.is_connected() and await tg.is_user_authorized():
@@ -167,11 +196,16 @@ class PosterWorker:
         self.authorized = False
         if not self.is_primary and tg.is_connected():
             # Connected but not authorized: the session was terminated in Telegram settings.
-            reason = "Сесію акаунта завершено в Telegram. Додайте акаунт повторно."
-            self._circuit_reason = reason
-            db.update_account(self.account, {"posting_enabled": False, "status": "unauthorized", "last_error": reason})
-            db.add_log("SYSTEM", "account_paused", f"{self.label}: {reason}", account=self.account)
+            self._mark_session_dead("Сесію акаунта завершено в Telegram. Додайте акаунт повторно.")
         return False
+
+    def _mark_session_dead(self, reason: str) -> None:
+        """Stop an additional account for good; the supervisor disconnects it once posting is disabled."""
+        self.authorized = False
+        self._circuit_reason = reason
+        self._log.error(f"Session is no longer usable: {reason}")
+        db.update_account(self.account, {"posting_enabled": False, "status": "unauthorized", "last_error": reason})
+        db.add_log("SYSTEM", "account_paused", f"{self.label}: {reason}", account=self.account)
 
     async def _run_loop(self):
         """Main polling, rate-limiting, and posting cycle."""
@@ -318,6 +352,9 @@ class PosterWorker:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                if not self.is_primary and isinstance(e, SESSION_DEAD_ERRORS):
+                    self._mark_session_dead(session_dead_reason(e))
+                    continue
                 self._log.error(f"Unexpected error in Poster loop: {e}", exc_info=True)
                 await self._wait(10, "Помилка планувальника — повторна перевірка")
 
@@ -488,6 +525,8 @@ class PosterWorker:
             return PostOutcome.CHAT_UNAVAILABLE
 
         except RPCError as e:
+            if not self.is_primary and isinstance(e, SESSION_DEAD_ERRORS):
+                raise  # An account problem, not a chat problem: the loop stops this account.
             err_text = str(e)
             if "SLOWMODE_WAIT" in err_text:
                 wait_sec = getattr(e, "seconds", 60)

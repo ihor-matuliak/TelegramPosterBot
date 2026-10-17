@@ -132,7 +132,12 @@ class AuthAPITests(unittest.TestCase):
         self.assertIn("Невірний пароль", res.json()["detail"])
 
     def test_logout(self):
-        res = self.http.post("/api/auth/logout")
+        # Never send real admin notifications with the BOT_TOKEN from .env.
+        admin_bot = ModuleType("bot.admin_bot")
+        admin_bot.notify_admins = AsyncMock()
+        with patch.dict(sys.modules, {"bot.admin_bot": admin_bot}):
+            res = self.http.post("/api/auth/logout")
+        admin_bot.notify_admins.assert_awaited_once()
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["status"], "ok")
 

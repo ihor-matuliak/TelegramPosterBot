@@ -9,8 +9,10 @@ import asyncio
 import hashlib
 import io
 import logging
+import socket
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from telethon import TelegramClient
@@ -26,14 +28,16 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 
 from config import config
-from core.poster import PosterWorker
-from database.client import db
+from core.poster import SESSION_DEAD_ERRORS, PosterWorker, session_dead_reason
+from database.client import LEASE_MIGRATION, db
 
 logger = logging.getLogger("Accounts")
 
 LOGIN_TTL_SECONDS = 15 * 60
 SYNC_INTERVAL_SECONDS = 15
 START_RETRY_SECONDS = 300
+# A process that stopped renewing (crash, kill, lost network) frees its accounts after this time.
+LEASE_TTL_SECONDS = 90
 
 
 class AccountLoginError(Exception):
@@ -331,14 +335,37 @@ def _session_fingerprint(session_string: str) -> str:
     return hashlib.sha256(session_string.encode()).hexdigest()
 
 
+def _lease_is_live(account: dict[str, Any]) -> bool:
+    heartbeat = account.get("worker_heartbeat_at")
+    if not account.get("worker_id") or not heartbeat:
+        return False
+    try:
+        beat = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - beat).total_seconds() < LEASE_TTL_SECONDS
+
+
 class AccountPosterSupervisor:
-    """Keeps exactly one PosterWorker running per additional account with posting enabled."""
+    """Keeps exactly one PosterWorker running per additional account with posting enabled.
+
+    Telegram revokes a session for good when it is used from two IP addresses at
+    once, so a process must hold the account's lease in the database before it
+    connects the session, and lets the worker go as soon as it cannot prove it
+    still holds the lease.
+    """
 
     def __init__(self) -> None:
+        self.instance_id = uuid.uuid4().hex
+        self.host = socket.gethostname()
         self.workers: dict[str, PosterWorker] = {}
         self.clients: dict[str, TelegramClient] = {}
         self._fingerprints: dict[str, str] = {}
-        self._retry_after: dict[str, float] = {}
+        self._renewed_at: dict[str, float] = {}
+        # account id -> (retry not before, fingerprint of the session that failed)
+        self._retry_after: dict[str, tuple[float, str]] = {}
+        self._waiting_logged: set[str] = set()
+        self._lease_warning_logged = False
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
@@ -346,6 +373,7 @@ class AccountPosterSupervisor:
         if not config.ACCOUNT_WORKERS_ENABLED:
             logger.warning("ACCOUNT_WORKERS_ENABLED=false: additional accounts will not post from this process.")
             return
+        logger.info(f"Account supervisor instance {self.instance_id[:8]} on host {self.host}.")
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="account-posters")
 
@@ -364,34 +392,72 @@ class AccountPosterSupervisor:
         async with self._lock:
             if not config.ACCOUNT_WORKERS_ENABLED or not db.supports_accounts():
                 return
+            if not db.supports_worker_leases():
+                if not self._lease_warning_logged:
+                    logger.error(f"Additional accounts are paused until {LEASE_MIGRATION} is applied: "
+                                 "without session leases two processes could get the sessions revoked.")
+                    self._lease_warning_logged = True
+                for account_id in list(self.workers):
+                    await self._stop_worker(account_id)
+                return
             accounts = db.get_accounts(include_session=True)
             wanted = {a["id"]: a for a in accounts if a.get("posting_enabled") and a.get("session_string")}
             for account_id in list(self.workers):
                 account = wanted.get(account_id)
                 if not account or _session_fingerprint(account["session_string"]) != self._fingerprints.get(account_id):
                     await self._stop_worker(account_id)
+            await self._renew_leases()
             for account_id, account in wanted.items():
-                if account_id not in self.workers and time.monotonic() >= self._retry_after.get(account_id, 0):
-                    await self._start_worker(account)
+                if account_id in self.workers:
+                    continue
+                retry = self._retry_after.get(account_id)
+                if retry and retry[1] == _session_fingerprint(account["session_string"]) and time.monotonic() < retry[0]:
+                    continue
+                await self._start_worker(account)
+
+    async def _renew_leases(self) -> None:
+        for account_id in list(self.workers):
+            owned = db.acquire_account_lease(account_id, self.instance_id, self.host, LEASE_TTL_SECONDS)
+            if owned:
+                self._renewed_at[account_id] = time.monotonic()
+            elif owned is False:
+                logger.error(f"Session lease of account {account_id} was taken over by another process; stopping.")
+                await self._stop_worker(account_id, release=False)
+            elif time.monotonic() - self._renewed_at.get(account_id, 0) > LEASE_TTL_SECONDS / 2:
+                # The database is unreachable: stop well before another process may take the lease.
+                logger.error(f"Cannot renew session lease of account {account_id}; stopping to keep it exclusive.")
+                await self._stop_worker(account_id, release=False)
 
     async def _start_worker(self, account: dict[str, Any]) -> None:
         account_id = account["id"]
         label = account.get("label") or account_id[:8]
+        if not db.acquire_account_lease(account_id, self.instance_id, self.host, LEASE_TTL_SECONDS):
+            if account_id not in self._waiting_logged:
+                logger.info(f"Account {label} is used by another process ({account.get('worker_host') or '?'}); waiting.")
+                self._waiting_logged.add(account_id)
+            return
+        self._waiting_logged.discard(account_id)
+        fingerprint = _session_fingerprint(account["session_string"])
         tg = create_account_client(account["session_string"])
         try:
             await tg.connect()
             authorized = await tg.is_user_authorized()
+        except SESSION_DEAD_ERRORS as e:
+            await self._disconnect(tg)
+            db.release_account_lease(account_id, self.instance_id)
+            self._session_dead(account_id, label, session_dead_reason(e))
+            return
         except Exception as e:
             logger.warning(f"Could not connect account {label}: {e}")
-            self._retry_after[account_id] = time.monotonic() + START_RETRY_SECONDS
+            self._retry_after[account_id] = (time.monotonic() + START_RETRY_SECONDS, fingerprint)
             db.update_account(account_id, {"status": "error", "last_error": f"Не вдалося підключитися: {e}"})
             await self._disconnect(tg)
+            db.release_account_lease(account_id, self.instance_id)
             return
         if not authorized:
-            reason = "Сесію акаунта завершено в Telegram. Додайте акаунт повторно."
-            db.update_account(account_id, {"posting_enabled": False, "status": "unauthorized", "last_error": reason})
-            db.add_log("SYSTEM", "account_paused", f"{label}: {reason}", account=account_id)
             await self._disconnect(tg)
+            db.release_account_lease(account_id, self.instance_id)
+            self._session_dead(account_id, label, "Сесію акаунта завершено в Telegram. Додайте акаунт повторно.")
             return
         if account.get("status") != "active":
             db.update_account(account_id, {"status": "active", "last_error": None})
@@ -399,19 +465,30 @@ class AccountPosterSupervisor:
         worker.authorized = True
         self.workers[account_id] = worker
         self.clients[account_id] = tg
-        self._fingerprints[account_id] = _session_fingerprint(account["session_string"])
+        self._fingerprints[account_id] = fingerprint
+        self._renewed_at[account_id] = time.monotonic()
         self._retry_after.pop(account_id, None)
         await worker.start()
         logger.info(f"Posting worker started for account {label}.")
 
-    async def _stop_worker(self, account_id: str) -> None:
+    @staticmethod
+    def _session_dead(account_id: str, label: str, reason: str) -> None:
+        logger.error(f"Account {label}: {reason}")
+        db.update_account(account_id, {"posting_enabled": False, "status": "unauthorized", "last_error": reason})
+        db.add_log("SYSTEM", "account_paused", f"{label}: {reason}", account=account_id)
+
+    async def _stop_worker(self, account_id: str, release: bool = True) -> None:
         worker = self.workers.pop(account_id, None)
         tg = self.clients.pop(account_id, None)
         self._fingerprints.pop(account_id, None)
+        self._renewed_at.pop(account_id, None)
         if worker:
             await worker.stop()
         if tg:
             await self._disconnect(tg)
+        if release and (worker or tg):
+            # Only after disconnecting, so the next owner never overlaps with this connection.
+            db.release_account_lease(account_id, self.instance_id)
 
     @staticmethod
     async def _disconnect(tg: TelegramClient) -> None:
@@ -427,25 +504,35 @@ class AccountPosterSupervisor:
             if logout:
                 account = db.get_account(account_id, include_session=True)
                 if account and account.get("session_string"):
-                    tg = create_account_client(account["session_string"])
-                    try:
-                        await tg.connect()
-                        if await tg.is_user_authorized():
-                            await tg.log_out()
-                    except Exception as e:
-                        logger.warning(f"Could not log out account {account_id}: {e}")
-                    finally:
-                        await self._disconnect(tg)
+                    if db.acquire_account_lease(account_id, self.instance_id, self.host, LEASE_TTL_SECONDS):
+                        tg = create_account_client(account["session_string"])
+                        try:
+                            await tg.connect()
+                            if await tg.is_user_authorized():
+                                await tg.log_out()
+                        except Exception as e:
+                            logger.warning(f"Could not log out account {account_id}: {e}")
+                        finally:
+                            await self._disconnect(tg)
+                    else:
+                        # Connecting here while another process uses the session would get it revoked anyway.
+                        logger.warning(f"Account {account_id} is used by another process; deleting without log out.")
             self._retry_after.pop(account_id, None)
             return db.delete_account(account_id)
 
-    def worker_status(self, account_id: str, settings: dict[str, Any], hourly: int, daily: int) -> dict[str, Any]:
+    def worker_status(self, account: dict[str, Any], settings: dict[str, Any], hourly: int, daily: int) -> dict[str, Any]:
+        account_id = account["id"]
         worker = self.workers.get(account_id)
+        if worker:
+            return worker.get_status(settings, bool(worker.authorized), hourly, daily)
+        if account.get("posting_enabled") and account.get("worker_id") != self.instance_id and _lease_is_live(account):
+            host = account.get("worker_host") or "інший сервер"
+            return {"state": "remote", "reason": f"Розсилку веде інший запущений процес ({host})", "until": None}
         if not config.ACCOUNT_WORKERS_ENABLED:
             return {"state": "stopped", "reason": "Воркери акаунтів вимкнені на цьому сервері", "until": None}
-        if not worker:
+        if not account.get("posting_enabled"):
             return {"state": "disabled", "reason": "Розсилку з акаунта вимкнено", "until": None}
-        return worker.get_status(settings, bool(worker.authorized), hourly, daily)
+        return {"state": "starting", "reason": "Очікує запуску воркера", "until": None}
 
     async def stop(self) -> None:
         if self._task:

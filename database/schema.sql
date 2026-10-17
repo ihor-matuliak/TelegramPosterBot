@@ -256,6 +256,9 @@ CREATE TABLE IF NOT EXISTS public.accounts (
     posting_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'active',          -- 'active', 'unauthorized', 'error'
     last_error TEXT DEFAULT NULL,
+    worker_id TEXT,                                 -- Lease: process that owns the session
+    worker_host TEXT,
+    worker_heartbeat_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );

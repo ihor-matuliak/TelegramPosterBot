@@ -107,6 +107,32 @@ class AccountScopeStorageTests(unittest.TestCase):
         self.assertEqual(calls[-1].method, "PATCH")
         self.assertEqual(calls[-1].url.params["id"], "eq.c1")
 
+    def test_lease_is_one_conditional_update(self):
+        seen = []
+
+        def handle(request):
+            seen.append(request)
+            return httpx.Response(200, json=[] if len(seen) > 1 else [{"id": ACCOUNT}])
+
+        db, http = make_db(handle)
+        db._leases_ready = True
+        with http:
+            self.assertTrue(db.acquire_account_lease(ACCOUNT, "me", "host", 90))
+            self.assertFalse(db.acquire_account_lease(ACCOUNT, "me", "host", 90))
+        request = seen[0]
+        self.assertEqual(request.method, "PATCH")
+        self.assertEqual(request.url.params["id"], f"eq.{ACCOUNT}")
+        condition = request.url.params["or"]
+        for part in ("worker_id.is.null", "worker_id.eq.me", "worker_heartbeat_at.lt."):
+            self.assertIn(part, condition)
+        self.assertEqual(json.loads(request.content)["worker_id"], "me")
+
+    def test_lease_unknown_when_database_fails(self):
+        db, http = make_db(lambda request: httpx.Response(500, json={"message": "down"}))
+        db._leases_ready = True
+        with http:
+            self.assertIsNone(db.acquire_account_lease(ACCOUNT, "me", "host", 90))
+
     def test_logs_of_additional_accounts_are_attributed(self):
         bodies = []
 
@@ -212,6 +238,17 @@ class AdditionalAccountPosterTests(unittest.IsolatedAsyncioTestCase):
         self.db.get_due_chats.assert_called_with(ACCOUNT)
         self.db.get_hourly_post_count.assert_called_with(ACCOUNT)
 
+    async def test_revoked_session_while_posting_stops_account_not_chat(self):
+        self.tg.get_entity.return_value = make_channel(left=False)
+        self.tg.send_message.side_effect = errors.AuthKeyDuplicatedError(None)
+        await self.run_loop([self.chat])
+        self.assertEqual(self.tg.send_message.await_count, 1)
+        self.db.update_chat_delay.assert_not_called()
+        self.db.update_chat.assert_not_called()
+        updates = self.db.update_account.call_args.args[1]
+        self.assertEqual(updates["status"], "unauthorized")
+        self.assertIn("двох IP", updates["last_error"])
+
     async def test_terminated_session_disables_account(self):
         self.tg.is_user_authorized.return_value = False
         await self.run_loop([self.chat])
@@ -225,6 +262,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.db = MagicMock()
         self.db.supports_accounts.return_value = True
+        self.db.supports_worker_leases.return_value = True
+        self.db.acquire_account_lease.return_value = True
         self.account = {"id": ACCOUNT, "label": "Second", "posting_enabled": True, "status": "active",
                         "session_string": "S1"}
         self.db.get_accounts.side_effect = lambda include_session=False: [dict(self.account)]
@@ -269,6 +308,74 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.db.supports_accounts.return_value = False
         await self.supervisor.sync()
         self.db.get_accounts.assert_not_called()
+
+    async def test_session_used_by_another_process_is_not_connected(self):
+        # Server + local copy, or old and new container during a redeploy: only one may connect.
+        self.db.acquire_account_lease.return_value = False
+        await self.supervisor.sync()
+        self.assertEqual(self.supervisor.workers, {})
+        self.tg.connect.assert_not_awaited()
+
+    async def test_no_workers_without_lease_migration(self):
+        await self.supervisor.sync()
+        self.db.supports_worker_leases.return_value = False
+        await self.supervisor.sync()
+        self.assertEqual(self.supervisor.workers, {})
+        self.tg.disconnect.assert_awaited()
+
+    async def test_lost_lease_stops_worker_without_releasing_it(self):
+        await self.supervisor.sync()
+        self.db.acquire_account_lease.return_value = False
+        await self.supervisor.sync()
+        self.assertEqual(self.supervisor.workers, {})
+        self.tg.disconnect.assert_awaited()
+        self.db.release_account_lease.assert_not_called()
+
+    async def test_unreachable_database_stops_worker_before_lease_expires(self):
+        await self.supervisor.sync()
+        self.db.acquire_account_lease.return_value = None
+        await self.supervisor.sync()
+        self.assertIn(ACCOUNT, self.supervisor.workers)  # a short outage is tolerated
+        self.supervisor._renewed_at[ACCOUNT] -= 46
+        await self.supervisor.sync()
+        self.assertEqual(self.supervisor.workers, {})
+
+    async def test_revoked_duplicate_session_is_disabled_not_retried(self):
+        self.tg.connect.side_effect = errors.AuthKeyDuplicatedError(None)
+        await self.supervisor.sync()
+        self.assertEqual(self.supervisor.workers, {})
+        updates = self.db.update_account.call_args.args[1]
+        self.assertFalse(updates["posting_enabled"])
+        self.assertEqual(updates["status"], "unauthorized")
+        self.assertIn("двох IP", updates["last_error"])
+        self.db.release_account_lease.assert_called_once_with(ACCOUNT, self.supervisor.instance_id)
+        self.assertNotIn(ACCOUNT, self.supervisor._retry_after)
+
+    async def test_connection_error_retries_at_once_after_relogin(self):
+        self.tg.connect.side_effect = [ConnectionError("offline"), None]
+        await self.supervisor.sync()
+        await self.supervisor.sync()
+        self.assertEqual(self.tg.connect.await_count, 1)  # same session waits for the retry delay
+        self.account["session_string"] = "S2"
+        await self.supervisor.sync()
+        self.assertIn(ACCOUNT, self.supervisor.workers)
+
+    async def test_stopping_worker_releases_lease_after_disconnect(self):
+        await self.supervisor.sync()
+        order = []
+        self.tg.disconnect.side_effect = lambda: order.append("disconnect")
+        self.db.release_account_lease.side_effect = lambda *a: order.append("release")
+        self.account["posting_enabled"] = False
+        await self.supervisor.sync()
+        self.assertEqual(order, ["disconnect", "release"])
+
+    async def test_status_shows_process_that_owns_the_session(self):
+        now = datetime.now(timezone.utc).isoformat()
+        status = self.supervisor.worker_status(
+            {"id": ACCOUNT, "posting_enabled": True, "worker_id": "other", "worker_host": "railway-1",
+             "worker_heartbeat_at": now}, {"is_running": True}, 0, 0)
+        self.assertEqual(status["state"], "remote")
+        self.assertIn("railway-1", status["reason"])
 
     async def test_disabled_workers_never_connect_sessions(self):
         # A local copy sharing the production database must not use the server's sessions.

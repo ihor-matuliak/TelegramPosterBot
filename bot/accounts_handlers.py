@@ -154,7 +154,7 @@ def _account_view(key: str) -> tuple[str, InlineKeyboardMarkup]:
         enabled = acc.get("posting_enabled")
         status = {"active": "🟢 сесія активна", "unauthorized": "🔴 сесію завершено", "error": "⚠️ помилка"}.get(
             acc.get("status"), acc.get("status") or "—")
-        poster = account_posters.worker_status(key, settings, hourly, daily)
+        poster = account_posters.worker_status(acc or {"id": key}, settings, hourly, daily)
         username = f"@{acc['username']}" if acc.get("username") else "без юзернейму"
         phone = f"+{acc['phone']}" if acc.get("phone") else "—"
         text = (

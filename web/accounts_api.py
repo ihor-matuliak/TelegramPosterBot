@@ -115,7 +115,7 @@ async def list_accounts() -> dict:
             "is_primary": False,
             "hourly": hourly,
             "daily": daily,
-            "poster": account_posters.worker_status(account["id"], settings, hourly, daily),
+            "poster": account_posters.worker_status(account, settings, hourly, daily),
             **counts.get(account["id"], empty),
         })
 

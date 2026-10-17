@@ -21,6 +21,8 @@ ACCOUNT_PUBLIC_FIELDS = (
     "posting_enabled,status,last_error,created_at,updated_at"
 )
 ACCOUNTS_MIGRATION = "database/migrations/20261015_multi_accounts.sql"
+LEASE_FIELDS = "worker_id,worker_host,worker_heartbeat_at"
+LEASE_MIGRATION = "database/migrations/20261017_account_worker_lease.sql"
 
 
 class ChatConflictError(Exception):
@@ -32,6 +34,8 @@ class SupabaseDB:
     _accounts_ready: bool = False
     _accounts_checked_at: float = float("-inf")
     _accounts_warned: bool = False
+    _leases_ready: bool = False
+    _leases_checked_at: float = float("-inf")
 
     def __init__(self):
         self.client: Optional[Client] = None
@@ -712,11 +716,69 @@ class SupabaseDB:
 
     # ==================== POSTING ACCOUNTS ====================
 
+    def supports_worker_leases(self) -> bool:
+        """True once the session lease migration is applied. Re-checked at most once a minute until then."""
+        if self._leases_ready:
+            return True
+        if not self.client or not self.supports_accounts():
+            return False
+        now = time.monotonic()
+        if now - self._leases_checked_at < 60:
+            return False
+        self._leases_checked_at = now
+        try:
+            self.client.table("accounts").select(LEASE_FIELDS).limit(1).execute()
+            self._leases_ready = True
+        except Exception as e:
+            logger.warning(f"Account session leases are not available yet (apply {LEASE_MIGRATION}): {e}")
+        return self._leases_ready
+
+    def _account_fields(self, include_session: bool) -> str:
+        fields = ACCOUNT_PUBLIC_FIELDS
+        if self.supports_worker_leases():
+            fields = f"{fields},{LEASE_FIELDS}"
+        return f"{fields},session_string" if include_session else fields
+
+    def acquire_account_lease(self, account_id: str, worker_id: str, host: str, ttl_seconds: int) -> Optional[bool]:
+        """Take or renew exclusive use of an account session.
+
+        One conditional UPDATE, so two processes can never both win. Returns
+        False when another live process holds the lease, None when the
+        database could not be asked (the caller must then assume it is not owned).
+        """
+        if not self.client or not self.supports_worker_leases():
+            return None
+        now = datetime.now(timezone.utc)
+        stale = (now - timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            res = (
+                self.client.table("accounts")
+                .update({"worker_id": worker_id, "worker_host": host, "worker_heartbeat_at": now.isoformat()})
+                .eq("id", account_id)
+                .or_(f'worker_id.is.null,worker_id.eq.{worker_id},worker_heartbeat_at.is.null,'
+                     f'worker_heartbeat_at.lt."{stale}"')
+                .execute()
+            )
+            return bool(res.data)
+        except Exception as e:
+            logger.error(f"Error acquiring session lease of account {account_id}: {e}")
+            return None
+
+    def release_account_lease(self, account_id: str, worker_id: str) -> None:
+        if not self.client or not self.supports_worker_leases():
+            return
+        try:
+            (self.client.table("accounts")
+             .update({"worker_id": None, "worker_host": None, "worker_heartbeat_at": None})
+             .eq("id", account_id).eq("worker_id", worker_id).execute())
+        except Exception as e:
+            logger.warning(f"Error releasing session lease of account {account_id}: {e}")
+
     def get_accounts(self, include_session: bool = False) -> List[Dict[str, Any]]:
         """List additional posting accounts. Session strings are returned only on request."""
         if not self.client or not self.supports_accounts():
             return []
-        fields = f"{ACCOUNT_PUBLIC_FIELDS},session_string" if include_session else ACCOUNT_PUBLIC_FIELDS
+        fields = self._account_fields(include_session)
         try:
             res = self.client.table("accounts").select(fields).order("created_at", desc=False).execute()
             return res.data or []
@@ -727,7 +789,7 @@ class SupabaseDB:
     def get_account(self, account_id: str, include_session: bool = False) -> Optional[Dict[str, Any]]:
         if not self.client or not account_id or not self.supports_accounts():
             return None
-        fields = f"{ACCOUNT_PUBLIC_FIELDS},session_string" if include_session else ACCOUNT_PUBLIC_FIELDS
+        fields = self._account_fields(include_session)
         try:
             res = self.client.table("accounts").select(fields).eq("id", account_id).limit(1).execute()
             return res.data[0] if res.data else None
