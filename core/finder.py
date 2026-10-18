@@ -8,8 +8,9 @@ from datetime import timezone
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from telethon import errors, utils
+from telethon.tl.functions import channels as channel_functions
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
-from telethon.tl.functions.contacts import SearchRequest
+from telethon.tl.functions.contacts import ResolveUsernameRequest, SearchRequest
 from telethon.tl.functions.messages import SearchGlobalRequest
 from telethon.tl.types import Channel, InputMessagesFilterEmpty, InputPeerEmpty
 
@@ -19,6 +20,16 @@ from core.discovery_relevance import clean_text
 from database.client import db, ChatSaveError
 
 logger = logging.getLogger("ChatFinder")
+# "Similar channels" (Telegram's own topical recommendations); absent in very old Telethon layers.
+RecommendationsRequest = getattr(channel_functions, "GetChannelRecommendationsRequest", None)
+
+
+class FloodDeferred(Exception):
+    """An optional request hit a long FloodWait; skip it instead of stalling the whole search."""
+
+    def __init__(self, seconds: int) -> None:
+        super().__init__(f"FloodWait {seconds}s")
+        self.seconds = seconds
 
 
 class TelegramDiscovery:
@@ -31,7 +42,7 @@ class TelegramDiscovery:
     async def ready(self) -> bool:
         return self.client.is_connected() and await self.client.is_user_authorized()
 
-    async def call(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+    async def call(self, operation: Callable[[], Awaitable[Any]], max_flood: int | None = None) -> Any:
         async with self._lock:
             failures = 0
             waited = False
@@ -43,6 +54,8 @@ class TelegramDiscovery:
                         await self.on_wait(0, "З’єднання відновлено. Продовжуємо пошук.")
                     return result
                 except errors.FloodWaitError as exc:
+                    if max_flood is not None and exc.seconds > max_flood:
+                        raise FloodDeferred(exc.seconds) from exc
                     delay = exc.seconds + 3
                     await self.on_wait(delay, "Telegram обмежив запити. Очікуємо дозволеного часу.")
                     await asyncio.sleep(delay)
@@ -59,7 +72,7 @@ class TelegramDiscovery:
                     )
 
     @staticmethod
-    def parse(chat: Any, query: str) -> dict[str, Any] | None:
+    def parse(chat: Any, query: str, source: str = "search", source_peer: str | None = None) -> dict[str, Any] | None:
         if not isinstance(chat, Channel) or not chat.username:
             return None
         group = bool(chat.megagroup and not getattr(chat, "gigagroup", False))
@@ -76,6 +89,7 @@ class TelegramDiscovery:
             "participants_count": getattr(chat, "participants_count", None),
             "can_post": access == "writable", "posting_access": access,
             "matched_query": query, "description": "", "messages": [], "last_message_at": None,
+            "source": source, "source_peer": source_peer, "linked_peer": None,
             "_entity": chat,
         }
 
@@ -146,9 +160,57 @@ class TelegramDiscovery:
             dated = [m for m in messages if getattr(m, "date", None)]
             if dated:
                 candidate["last_message_at"] = max(m.date for m in dated).astimezone(timezone.utc).isoformat()
+            # Many different authors posting promos means the group tolerates ads.
+            candidate["message_senders"] = len({m.sender_id for m in messages if getattr(m, "sender_id", None)})
+            # Channels forwarded into the group arrive with the response: snowball leads without extra requests.
+            forwards = []
+            for m in messages:
+                chat = getattr(getattr(m, "forward", None), "chat", None)
+                if isinstance(chat, Channel) and chat.username and chat not in forwards:
+                    forwards.append(chat)
+            candidate["_forward_chats"] = forwards
         except inaccessible:
             pass
         return candidate
+
+    async def expand_channel(self, candidate: dict[str, Any]) -> list[dict[str, Any]]:
+        """For a topical channel: its discussion group (where members can post) and similar channels."""
+        found: list[dict[str, Any]] = []
+        query, peer = candidate.get("matched_query", ""), candidate["peer"]
+        try:
+            entity = candidate.get("_entity") or await self.call(lambda: self.client.get_entity(peer))
+            full = await self.call(lambda: self.client(GetFullChannelRequest(entity), flood_sleep_threshold=0))
+        except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.UsernameNotOccupiedError,
+                errors.UsernameInvalidError, ValueError):
+            return found
+        candidate["description"] = clean_text(full.full_chat.about or "")[:2000]
+        count = getattr(full.full_chat, "participants_count", None)
+        if count is not None:
+            candidate["participants_count"] = count
+        linked_id = getattr(full.full_chat, "linked_chat_id", None)
+        linked = next((c for c in full.chats if linked_id and c.id == linked_id), None)
+        if linked is not None and getattr(linked, "username", None):
+            candidate["linked_peer"] = f"@{linked.username}"
+            if row := self.parse(linked, query, "linked", peer):
+                found.append(row)
+        if RecommendationsRequest is not None:
+            try:
+                recommended = await self.call(
+                    lambda: self.client(RecommendationsRequest(channel=entity), flood_sleep_threshold=0), max_flood=120)
+                found.extend(row for chat in recommended.chats if (row := self.parse(chat, query, "similar", peer)))
+            except (FloodDeferred, errors.RPCError) as exc:
+                logger.info("Similar channels unavailable for %s (%s)", peer, type(exc).__name__)
+        return found
+
+    async def resolve(self, username: str, source: str, source_peer: str | None) -> dict[str, Any] | None:
+        """Resolve a mentioned @username. ResolveUsername is strictly limited, so long waits are deferred."""
+        try:
+            resolved = await self.call(lambda: self.client(ResolveUsernameRequest(username), flood_sleep_threshold=0),
+                                       max_flood=120)
+        except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, errors.ChannelPrivateError):
+            return None
+        chat = next(iter(resolved.chats), None)
+        return self.parse(chat, f"@{username}", source, source_peer) if chat is not None else None
 
 
 class ChatFinder:

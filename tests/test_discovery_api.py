@@ -58,7 +58,7 @@ class DiscoveryAPITests(unittest.TestCase):
     def test_history_pagination(self):
         with patch("web.discovery_api.repository.results", new=AsyncMock(return_value={"results": [], "total": 80})) as results:
             response = self.client.get("/api/discovery/history?offset=50&limit=30&decision=all&include_hidden=true")
-        results.assert_awaited_once_with(None, 50, 30, "all", True)
+        results.assert_awaited_once_with(None, 50, 30, "all", True, sort="recent", language="all")
         self.assertEqual(response.status_code, 200)
 
     def test_obsolete_endpoint_has_clear_error(self):

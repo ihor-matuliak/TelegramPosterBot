@@ -16,7 +16,7 @@ from core.discovery import DiscoveryManager
 from core.discovery_relevance import plan_queries, qualify
 from core.ai_discovery import AIDiscoveryEngine, Assessment
 from core.finder import TelegramDiscovery
-from database.discovery import DiscoveryRepository, DiscoveryStorageError
+from database.discovery import DiscoveryRepository, DiscoveryStorageError, SessionStopped
 from telethon import errors
 from telethon.tl.types import Channel
 
@@ -94,6 +94,7 @@ class AIQualificationTests(unittest.IsolatedAsyncioTestCase):
 class MemoryRepository:
     def __init__(self):
         self.sessions, self.rows, self.query_rows, self.cursors = {}, {}, {}, {}
+        self.stats, self.owner, self.leads = {}, {}, {}
         self.saved = asyncio.Event()
 
     async def preflight(self): pass
@@ -104,9 +105,23 @@ class MemoryRepository:
         self.sessions[session["id"]] = session
         return dict(session)
     async def session(self, sid): return self.sessions.get(sid)
-    async def update(self, sid, **fields): self.sessions[sid].update(fields)
+    async def update(self, sid, running_only=False, **fields):
+        if running_only and self.sessions[sid]["status"] not in ["pending", "searching", "scoring", "waiting"]:
+            raise SessionStopped(sid)
+        self.sessions[sid].update(fields)
     async def queries(self, sid): return self.query_rows.get(sid, [])
+    async def query_stats(self, sid): return {q: {"found": 0, "accepted": 0, "empty": 0} for q in self.query_rows.get(sid, [])}
     async def save_queries(self, sid, queries): self.query_rows.setdefault(sid, []).extend(queries)
+    async def save_query_stats(self, sid, query, stats): self.stats[(sid, query)] = dict(stats)
+    async def claim(self, sid, worker, ttl): return self.owner.setdefault(sid, worker) == worker
+    async def release(self, sid, worker): self.owner.pop(sid, None)
+    async def accepted_titles(self, sid, limit=15): return []
+    async def add_leads(self, sid, leads):
+        fresh = [l for l in leads if l["username"].lower() not in self.leads]
+        for l in fresh: self.leads[l["username"].lower()] = {**l, "id": l["username"].lower(), "status": "pending"}
+        return len(fresh)
+    async def pending_leads(self, limit): return [l for l in self.leads.values() if l["status"] == "pending"][:limit]
+    async def finish_lead(self, lead_id, status): self.leads[lead_id]["status"] = status
     async def existing_peers(self): return set()
     async def known(self, tid, peer): return tid in self.rows
     async def cursor(self, sid, query): return self.cursors.get((sid, query), {})
@@ -120,22 +135,25 @@ class MemoryRepository:
         self.rows[row["telegram_id"]] = {**row, "search_id": sid}
     async def pending(self, sid):
         return [copy.deepcopy(r) for r in self.rows.values() if r["search_id"] == sid and r.get("assessed_by") == "pending"]
-    async def results(self, sid=None, offset=0, limit=50, decision="accepted", include_hidden=False):
+    async def results(self, sid=None, offset=0, limit=50, decision="accepted", include_hidden=False, sort="recent", language="all"):
         rows = [r for r in self.rows.values() if (sid is None or r["search_id"] == sid) and (decision == "all" or r["decision"] == decision)]
         return {"results": rows[offset:offset+limit], "total": len(rows)}
 
 
 class FakeAI:
     status = "disabled"
-    async def expand(self, query, previous): return []
+    async def expand(self, query, previous, best=None, examples=None): return []
     async def assess(self, row, minimum): return qualify(row, minimum)
     async def close(self): pass
 
 
 class FakeTransport:
+    parse = staticmethod(TelegramDiscovery.parse)
     def __init__(self, client, on_wait): pass
     async def ready(self): return True
     async def enrich(self, row): return row
+    async def expand_channel(self, row): return []
+    async def resolve(self, username, source, source_peer): return None
     async def search(self, query, cursor):
         yield [candidate(), candidate(peer="@renamed_agency")], {"id": 42}
 

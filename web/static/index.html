@@ -200,7 +200,7 @@
                             <button type="button" id="finderStopBtn" class="tg-btn tg-btn-secondary" disabled>Стоп</button>
                         </div>
                     </form>
-                    <p class="discovery-help">Пошук триває на сервері до зупинки. Між циклами й під час обмежень Telegram можливі паузи. AI доповнює пошукові слова.</p>
+                    <p class="discovery-help">Пошук триває на сервері до зупинки. Крім пошуку за словами, парсер перевіряє групи обговорення тематичних каналів, схожі канали та групи, які згадують або пересилають у вже знайдених цільових групах. Мови: EN, ES, PT, DE, FR, IT, RU, UA. Знайдені раніше чати не повторюються.</p>
                     <div class="discovery-status" role="status" aria-live="polite">
                         <p id="discoveryStatusText">Готово до пошуку</p>
                         <p id="discoveryCurrentQuery"></p><p id="discoveryStats"></p>
@@ -220,8 +220,19 @@
                     <div class="card-header discovery-results-header">
                         <h2 class="card-title" id="finderResultsCountTitle">Результати пошуку</h2>
                         <label>Показати<select id="discoveryDecision" class="tg-select">
-                            <option value="accepted">Цільові групи</option><option value="unverified">Не перевірені</option>
-                            <option value="rejected">Відхилені</option><option value="below_minimum">Нижче порогу учасників</option><option value="all">Усі знахідки</option>
+                            <option value="accepted">Цільові групи</option><option value="channel">Тематичні канали</option>
+                            <option value="not_postable">Писати заборонено</option><option value="inactive">Неактивні</option>
+                            <option value="unverified">Не перевірені</option><option value="rejected">Відхилені</option>
+                            <option value="below_minimum">Нижче порогу учасників</option><option value="all">Усі знахідки</option>
+                        </select></label>
+                        <label>Сортування<select id="discoverySort" class="tg-select">
+                            <option value="score">Найкращі для реклами</option><option value="new">Нові спершу</option>
+                        </select></label>
+                        <label>Мова<select id="discoveryLanguage" class="tg-select">
+                            <option value="all">Усі мови</option><option value="en">English</option><option value="es">Español</option>
+                            <option value="pt">Português</option><option value="de">Deutsch</option><option value="fr">Français</option>
+                            <option value="it">Italiano</option><option value="ru">Русский</option><option value="uk">Українська</option>
+                            <option value="other">Інші</option>
                         </select></label>
                         <button type="button" id="batchAddFoundBtn" class="tg-btn tg-btn-primary" hidden>Додати вибрані</button>
                     </div>

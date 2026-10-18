@@ -17,7 +17,10 @@ from database.discovery import ACTIVE_STATUSES, DiscoveryRepository, DiscoverySt
 router = APIRouter(prefix="/api/discovery")
 repository = DiscoveryRepository(db.client)
 manager = DiscoveryManager(repository, client)
-Decision = Literal["accepted", "unverified", "rejected", "below_minimum", "existing", "all"]
+Decision = Literal["accepted", "unverified", "rejected", "below_minimum", "existing",
+                   "channel", "not_postable", "inactive", "all"]
+Sort = Literal["recent", "score", "new"]
+Language = Literal["all", "en", "es", "pt", "de", "fr", "it", "ru", "uk", "other"]
 
 
 class SearchRequest(BaseModel):
@@ -69,19 +72,20 @@ async def stop_search(search_id: UUID) -> dict:
 
 @router.get("/results/{search_id}")
 async def results(search_id: UUID, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100),
-                  decision: Decision = "accepted") -> dict:
+                  decision: Decision = "accepted", sort: Sort = "recent", language: Language = "all") -> dict:
     session = await repository.session(str(search_id))
     if not session:
         raise HTTPException(404, "Сесію не знайдено.")
-    page = await repository.results(str(search_id), offset, limit, decision)
+    page = await repository.results(str(search_id), offset, limit, decision, sort=sort, language=language)
     return {**page, "search": session, "is_completed": session["status"] not in ACTIVE_STATUSES,
             "error": manager.runtime_error if manager.search_id == str(search_id) else None}
 
 
 @router.get("/history")
 async def history(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100),
-                  decision: Decision = "all", include_hidden: bool = False) -> dict:
-    return await repository.results(None, offset, limit, decision, include_hidden)
+                  decision: Decision = "all", include_hidden: bool = False,
+                  sort: Sort = "recent", language: Language = "all") -> dict:
+    return await repository.results(None, offset, limit, decision, include_hidden, sort=sort, language=language)
 
 
 @router.post("/add-to-posting")

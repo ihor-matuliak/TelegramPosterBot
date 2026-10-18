@@ -11,13 +11,14 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from config import config
-from core.discovery_relevance import PRODUCT_CONTEXT, clean_text, qualify
+from core.discovery_relevance import (PRODUCT_CONTEXT, TARGET_LANGUAGES, clean_text, qualify, rank,
+                                      usefulness_gate)
 
 logger = logging.getLogger("AIDiscovery")
 
 
 class QueryExpansion(BaseModel):
-    queries: list[str] = Field(default_factory=list, max_length=15)
+    queries: list[str] = Field(default_factory=list, max_length=20)
 
 
 class Assessment(BaseModel):
@@ -26,6 +27,7 @@ class Assessment(BaseModel):
     relevance: int = Field(ge=0, le=100)
     reason: str = Field(max_length=400)
     evidence: list[str] = Field(default_factory=list, max_length=3)
+    language: str = Field(default="", max_length=8)
 
 
 class AIDiscoveryEngine:
@@ -65,20 +67,27 @@ class AIDiscoveryEngine:
             self._retry_after = time.monotonic() + 300
             return None
 
-    async def expand(self, user_query: str, previous: list[str]) -> list[str]:
+    async def expand(self, user_query: str, previous: list[str], best: list[str] | None = None,
+                     examples: list[str] | None = None) -> list[str]:
         data = await self._json(
-            f"Target buyers: {PRODUCT_CONTEXT}\nUser seeds: {json.dumps(user_query)}\n"
-            f"Already used: {json.dumps(previous, ensure_ascii=False)}\n"
-            "Suggest up to 15 NEW short Telegram directory search queries in Ukrainian, Russian "
-            "and English. Include professional slang and platform names. No fan/content feeds, "
-            "no unrelated topics. Avoid bare ambiguous OF/Fans/traffic. JSON: {queries: [string]}.",
+            f"Target buyers: {PRODUCT_CONTEXT}\nUser seeds: {json.dumps(user_query, ensure_ascii=False)}\n"
+            f"Already used: {json.dumps(previous[-150:], ensure_ascii=False)}\n"
+            f"Queries that found target groups: {json.dumps(best or [], ensure_ascii=False)}\n"
+            f"Titles of groups that qualified: {json.dumps(examples or [], ensure_ascii=False)}\n"
+            "Suggest up to 20 NEW short (1-4 words) Telegram search queries that would find MORE groups "
+            f"like the qualified ones. Spread them over {TARGET_LANGUAGES}: the audience is worldwide, "
+            "not only CIS. Use the words people put in such group titles: professional slang (SFS, "
+            "shoutout, chatters, OFM, agency, management, traffic, Reddit promo), platform names and "
+            "local-language equivalents. No fan/content feeds, no unrelated topics. Avoid bare ambiguous "
+            "OF/Fans/traffic. JSON: {queries: [string]}.",
             QueryExpansion,
         )
         return [clean_text(q)[:80] for q in data.queries if 3 <= len(clean_text(q)) <= 80] if isinstance(data, QueryExpansion) else []
 
     async def assess(self, candidate: dict[str, Any], min_members: int) -> dict[str, Any]:
         result = qualify(candidate, min_members)
-        if result["decision"] in {"unverified", "below_minimum"} or candidate.get("type") != "group":
+        # Not actionable either way: no AI quota for them.
+        if result["decision"] in {"unverified", "below_minimum", "not_postable", "inactive"} or candidate.get("type") != "group":
             return result
         messages = candidate.get("messages", [])
         if not messages:
@@ -87,8 +96,10 @@ class AIDiscoveryEngine:
             f"Target: {PRODUCT_CONTEXT}\nClassify the whole group, not a single stray ad. "
             "A Reddit meme group, fan feed, generic account market or general traffic chat "
             "without adult business context does not qualify. Return professional_audience, "
-            "adult_business, relevance (0..100), reason in Ukrainian, and up to 3 short "
-            "EXACT quotations as evidence. Relevance means audience fit, not permission to post.\n"
+            "adult_business, relevance (0..100), reason in Ukrainian, up to 3 short EXACT quotations "
+            "as evidence and the group's main language as an ISO 639-1 code. The group may be in any "
+            "language (English, Spanish, Portuguese, German, French, Italian, Russian, Ukrainian...); "
+            "language is never a reason to reject. Relevance means audience fit, not permission to post.\n"
             + json.dumps({"title": candidate["title"], "description": candidate.get("description", ""),
                           "messages": messages}, ensure_ascii=False), Assessment,
         )
@@ -99,13 +110,19 @@ class AIDiscoveryEngine:
         supporting_messages = sum(any(q in m for q in quotes) for m in messages)
         positive = data.professional_audience and data.adult_business and data.relevance >= 70
         supported = bool(quotes) and (result["decision"] == "accepted" or supporting_messages >= 2)
+        if len(data.language) == 2 and data.language.isalpha():
+            result["language"] = data.language.lower()
+        score = rank(data.relevance, candidate.get("participants_count"), result["activity_score"], result["ad_policy"])
         if positive and supported:
-            result.update(decision="accepted", relevance_score=data.relevance, final_score=data.relevance,
-                          classification="relevant", ai_reason=data.reason, evidence=quotes, assessed_by="ai")
+            # Same posting/liveliness checks as the rules apply.
+            decision, reason = usefulness_gate("accepted", data.reason, candidate)
+            result.update(decision=decision, relevance_score=data.relevance, final_score=score,
+                          classification="relevant" if decision == "accepted" else "irrelevant",
+                          ai_reason=reason, evidence=quotes, assessed_by="ai")
             if result["topic"] == "unverified":
                 result["topic"] = "ofm_business"
         elif not positive:
-            result.update(decision="rejected", relevance_score=data.relevance, final_score=data.relevance,
+            result.update(decision="rejected", relevance_score=data.relevance, final_score=score,
                           classification="irrelevant", ai_reason=data.reason, assessed_by="ai")
         return result
 

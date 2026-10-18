@@ -1519,3 +1519,7 @@ input:checked + .slider:before {
     .account-picker .tg-select { min-width: 0; width: 100%; }
     .account-picker { width: 100%; }
 }
+
+/* Discovery v2: facts and where a chat was found */
+.discovery-facts { color: var(--text-primary); font-size: 13px; margin-top: 6px; }
+.discovery-source { color: var(--accent-blue-hover); font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }

@@ -21,6 +21,20 @@ async function discoveryRequest(url, options = {}) {
     return data;
 }
 
+function discoveryFilters() {
+    const sort = document.getElementById('discoverySort')?.value || 'score';
+    const language = document.getElementById('discoveryLanguage')?.value || 'all';
+    return `&sort=${encodeURIComponent(sort)}&language=${encodeURIComponent(language)}`;
+}
+
+function timeAgo(iso) {
+    if (!iso) return null;
+    const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+    if (minutes < 60) return `${minutes} хв тому`;
+    if (minutes < 1440) return `${Math.round(minutes / 60)} год тому`;
+    return `${Math.round(minutes / 1440)} дн тому`;
+}
+
 function discoveryMessage(message, error = false) {
     const node = document.getElementById('discoveryStatusText');
     node.textContent = message;
@@ -110,7 +124,7 @@ async function pollDiscoverySession() {
     const generation = discoveryGeneration;
     try {
         const decision = document.getElementById('discoveryDecision').value;
-        const data = await discoveryRequest(`/api/discovery/results/${sessionId}?offset=${discoveryOffset}&limit=${discoveryPageSize}&decision=${decision}`);
+        const data = await discoveryRequest(`/api/discovery/results/${sessionId}?offset=${discoveryOffset}&limit=${discoveryPageSize}&decision=${decision}${discoveryFilters()}`);
         if (sessionId !== activeDiscoverySessionId) return;
         const session = data.search;
         setDiscoveryRunning(!discoveryTerminal.has(session.status));
@@ -148,7 +162,7 @@ async function loadDiscoveryPage() {
             }
             await pollDiscoverySession();
         } else {
-            const data = await discoveryRequest(`/api/discovery/history?offset=${discoveryOffset}&limit=${discoveryPageSize}&decision=${decision}&include_hidden=true`);
+            const data = await discoveryRequest(`/api/discovery/history?offset=${discoveryOffset}&limit=${discoveryPageSize}&decision=${decision}&include_hidden=true${discoveryFilters()}`);
             if (generation === discoveryGeneration) applyDiscoveryPage(data);
         }
     } catch (error) { discoveryMessage(error.message, true); }
@@ -186,9 +200,12 @@ function renderDiscoveryCards(results) {
     // Preserve focus when a live update replaces cards.
     const focusedId = grid.contains(document.activeElement) ? document.activeElement.id : null;
     grid.replaceChildren();
-    const decisions = { accepted: 'Цільова група', rejected: 'Відхилено', unverified: 'Не перевірено', below_minimum: 'Мало учасників', existing: 'Уже в розсилці' };
+    const decisions = { accepted: 'Цільова група', rejected: 'Відхилено', unverified: 'Не перевірено', below_minimum: 'Мало учасників',
+        existing: 'Уже в розсилці', channel: 'Тематичний канал', not_postable: 'Писати заборонено', inactive: 'Неактивна' };
     const access = { writable: 'Можна писати', join_required: 'Потрібно вступити', approval_required: 'Вступ за заявкою', restricted: 'Запис обмежено', unknown: 'Доступ невідомий' };
-    const ads = { allowed: 'Реклама дозволена за описом', prohibited: 'Реклама заборонена за описом', unknown: 'Правила реклами не підтверджені' };
+    const ads = { allowed: 'Реклама дозволена за описом', likely_allowed: 'Схоже, рекламу публікують (багато промо від різних авторів)',
+        prohibited: 'Реклама заборонена за описом', unknown: 'Правила реклами не підтверджені' };
+    const sources = { mention: 'згадка в', forward: 'пересилання в', linked: 'група обговорення каналу', similar: 'схожий на канал' };
     if (!results.length) grid.append(discoveryNode('p', 'discovery-empty', 'За цим фільтром поки немає груп. Нові результати з’являтимуться під час пошуку.'));
     for (const item of results) {
         const card = discoveryNode('article', 'discovery-card');
@@ -208,6 +225,17 @@ function renderDiscoveryCards(results) {
         card.append(heading);
         const count = item.members_count == null ? 'учасники: невідомо' : `${Number(item.members_count).toLocaleString()} учасників`;
         card.append(discoveryNode('p', 'discovery-peer', `${item.telegram_peer} · ${count}`));
+        const facts = [];
+        if (item.language) facts.push(`Мова: ${item.language.toUpperCase()}`);
+        if (item.final_score != null && item.decision === 'accepted') facts.push(`Оцінка: ${item.final_score}/100`);
+        const active = timeAgo(item.last_message_at);
+        if (active) facts.push(`Останнє повідомлення: ${active}`);
+        if (facts.length) card.append(discoveryNode('p', 'discovery-facts', facts.join(' · ')));
+        const via = sources[item.source] && item.source_peer
+            ? `Знайдено: ${sources[item.source]} ${item.source_peer}`
+            : (item.matched_query ? `Знайдено за запитом «${item.matched_query}»` : '');
+        if (via) card.append(discoveryNode('p', 'discovery-source', via));
+        if (item.linked_peer) card.append(discoveryNode('p', 'discovery-source', `Група обговорення: ${item.linked_peer} (перевіряється окремо)`));
         card.append(discoveryNode('p', 'discovery-desc', item.description || 'Опис недоступний'));
         card.append(discoveryNode('p', 'discovery-access', `${access[item.posting_access] || access.unknown} · ${ads[item.ad_policy] || ads.unknown}`));
         card.append(discoveryNode('p', 'ai-reason-box', `${item.assessed_by === 'ai' ? 'AI' : 'Перевірка'}: ${item.ai_reason || 'Результат попередньої версії парсера.'}`));
@@ -227,10 +255,11 @@ function renderDiscoveryCards(results) {
             link.target = '_blank'; link.rel = 'noopener noreferrer'; actions.append(link);
         }
         if (item.status !== 'hidden') {
-            const hide = discoveryNode('button', 'tg-btn tg-btn-secondary', 'Приховати');
+            const hide = discoveryNode('button', 'tg-btn tg-btn-secondary', 'Не підходить');
             hide.id = `hide-${item.id}`;
+            hide.title = 'Сховати й більше не показувати в результатах';
             hide.addEventListener('click', () => hideDiscoveryCandidate(item.id)); actions.append(hide);
-        } else actions.append(discoveryNode('span', '', 'Приховано'));
+        } else actions.append(discoveryNode('span', '', 'Позначено як «не підходить»'));
         if (item.status === 'added_to_posting') actions.append(discoveryNode('span', '', 'Додано в розсилку'));
         else if (item.chat_type === 'group') {
             const add = discoveryNode('button', 'tg-btn tg-btn-primary', 'Додати в розсилку');
@@ -306,7 +335,9 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('finderStopBtn').addEventListener('click', stopDiscoverySearch);
     document.getElementById('discoveryHistoryBtn').addEventListener('click', () => showDiscoveryView('history'));
     document.getElementById('discoverySessionBtn').addEventListener('click', () => showDiscoveryView('session'));
-    document.getElementById('discoveryDecision').addEventListener('change', () => { discoveryOffset = 0; selectedDiscoveryPeers.clear(); loadDiscoveryPage(); });
+    for (const id of ['discoveryDecision', 'discoverySort', 'discoveryLanguage']) {
+        document.getElementById(id).addEventListener('change', () => { discoveryOffset = 0; selectedDiscoveryPeers.clear(); loadDiscoveryPage(); });
+    }
     document.getElementById('discoveryPrev').addEventListener('click', () => changeDiscoveryPage(-1));
     document.getElementById('discoveryNext').addEventListener('click', () => changeDiscoveryPage(1));
     restoreDiscoverySession();
